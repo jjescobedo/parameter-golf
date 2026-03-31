@@ -27,6 +27,9 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Auto-detected at startup in main(); used by eval_val and training loop
+_amp_dtype = torch.bfloat16
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -734,7 +737,7 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, _amp_dtype
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
