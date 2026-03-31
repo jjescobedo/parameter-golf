@@ -738,10 +738,7 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    try:
-        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    except Exception:
-        pass  # torch.compile not supported on this platform
+    # torch.compile/triton requires CUDA capability >= 7.0; defer check until after device setup
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -771,6 +768,11 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     cap = torch.cuda.get_device_capability(device)
     _amp_dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+    if cap[0] >= 7:
+        try:
+            zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+        except Exception:
+            pass
     try:
         from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
         enable_cudnn_sdp(False)
@@ -857,10 +859,13 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    try:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    except Exception:
-        compiled_model = base_model  # fallback if torch.compile unsupported
+    if cap[0] >= 7:
+        try:
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+        except Exception:
+            compiled_model = base_model
+    else:
+        compiled_model = base_model  # torch.compile/triton needs CUDA cap >= 7.0
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
