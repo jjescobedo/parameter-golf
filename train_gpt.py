@@ -100,6 +100,7 @@ class Hyperparameters:
     kmeans_iters = int(os.environ.get("KMEANS_ITERS", "20"))
     qat_bits = int(os.environ.get("QAT_BITS", "5"))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
+    eval_early_stop_pct = float(os.environ.get("EVAL_EARLY_STOP_PCT", "20"))  # 0 = run full eval
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -1117,14 +1118,16 @@ def eval_val_sliding(
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 byte_count += tb.sum()
+            done = min(bi + batch_seqs, len(my_windows))
+            pct = done / len(my_windows) * 100
             if rank == 0 and (bi // batch_seqs) % 50 == 0:
-                done = min(bi + batch_seqs, len(my_windows))
-                pct = done / len(my_windows) * 100
                 running_bpb = 0.0
                 if token_count.item() > 0:
                     rl = (loss_sum / token_count).item()
                     running_bpb = rl / math.log(2.0) * (token_count.item() / byte_count.item())
                 print(f"  sliding_eval [{pct:5.1f}%] {done}/{len(my_windows)} windows running_bpb={running_bpb:.6f}", flush=True)
+            if args.eval_early_stop_pct > 0 and pct >= args.eval_early_stop_pct:
+                break
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
