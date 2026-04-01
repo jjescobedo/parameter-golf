@@ -98,6 +98,8 @@ class Hyperparameters:
     adaptive_target_bytes = int(os.environ.get("ADAPTIVE_TARGET_BYTES", "15000000"))
     learned_cb_bits = int(os.environ.get("LEARNED_CB_BITS", "5"))
     kmeans_iters = int(os.environ.get("KMEANS_ITERS", "20"))
+    qat_bits = int(os.environ.get("QAT_BITS", "5"))
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -804,11 +806,28 @@ class RMSNorm(nn.Module):
         return _rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+_qat_active = False
+
+def _fake_quantize_ste(w: Tensor, bits: int) -> Tensor:
+    """STE fake quantization: uniform per-row quantize+dequantize, gradients pass through."""
+    k = (1 << bits) - 1
+    amax = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    w_norm = w / amax                          # [-1, 1]
+    w_01 = (w_norm + 1) * 0.5                  # [0, 1]
+    w_int = (w_01 * k).round().clamp(0, k)     # [0, k] rounded
+    # STE: forward uses rounded, backward passes through as if rounding didn't happen
+    w_int = w_01 * k + (w_int - w_01 * k).detach()
+    w_deq = (w_int / k * 2 - 1) * amax        # back to original scale
+    return w_deq
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if _qat_active and w.ndim == 2:
+            w = _fake_quantize_ste(w, Hyperparameters.qat_bits)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1424,6 +1443,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        # Enable QAT during warmdown (when lr starts decaying)
+        global _qat_active
+        if args.qat_enabled and scale < 1.0 and not _qat_active:
+            _qat_active = True
+            log0(f"QAT enabled at step {step} (warmdown start, {args.qat_bits}-bit)")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
