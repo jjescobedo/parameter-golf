@@ -95,6 +95,9 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    use_kronecker_mlp = bool(int(os.environ.get("USE_KRONECKER_MLP", "0")))
+    kronecker_terms = int(os.environ.get("KRONECKER_TERMS", "8"))
+    ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.0"))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
 # -----------------------------
@@ -723,6 +726,68 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class KroneckerMLP(nn.Module):
+    """MLP using sum of Kronecker products for extreme parameter efficiency."""
+    def __init__(self, dim: int, mlp_mult: int, num_terms: int = 8):
+        super().__init__()
+        hidden = mlp_mult * dim
+        self.dim = dim
+        self.hidden = hidden
+        self.num_terms = num_terms
+        # Factor dimensions: dim = a1*b1, hidden = a2*b2
+        self.a1, self.b1 = 32, dim // 32       # 32 * 16 = 512
+        self.a2, self.b2 = hidden // 32, 32     # 48 * 32 = 1536
+
+        # Up-projection factors: kron(fc_A[k], fc_B[k]) gives (dim -> hidden)
+        self.fc_A = nn.Parameter(torch.randn(num_terms, self.a1, self.a2) * 0.02)
+        self.fc_B = nn.Parameter(torch.randn(num_terms, self.b1, self.b2) * 0.02)
+        # Down-projection factors: kron(proj_A[k], proj_B[k]) gives (hidden -> dim)
+        self.proj_A = nn.Parameter(torch.zeros(num_terms, self.a2, self.a1))
+        self.proj_B = nn.Parameter(torch.zeros(num_terms, self.b2, self.b1))
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz_seq = x.shape[:-1]  # (batch, seq_len)
+        # Up-projection: x (*, dim) -> h (*, hidden)
+        # x reshaped as (*, a1, b1), compute sum_k (fc_A[k] @ x_mat @ fc_B[k]^T)
+        x_mat = x.reshape(*bsz_seq, self.a1, self.b1)
+        h = torch.zeros(*bsz_seq, self.a2, self.b2, device=x.device, dtype=x.dtype)
+        for k in range(self.num_terms):
+            h = h + torch.einsum('ia,...ab,jb->...ij', self.fc_A[k].to(x.dtype), x_mat, self.fc_B[k].to(x.dtype))
+        h = h.reshape(*bsz_seq, self.hidden)
+        h = torch.relu(h).square()
+        # Down-projection: h (*, hidden) -> out (*, dim)
+        h_mat = h.reshape(*bsz_seq, self.a2, self.b2)
+        out = torch.zeros(*bsz_seq, self.a1, self.b1, device=x.device, dtype=x.dtype)
+        for k in range(self.num_terms):
+            out = out + torch.einsum('ia,...ab,jb->...ij', self.proj_A[k].to(x.dtype), h_mat, self.proj_B[k].to(x.dtype))
+        return out.reshape(*bsz_seq, self.dim)
+
+
+def compute_bigram_logprobs(input_ids: Tensor, vocab_size: int) -> Tensor:
+    """Compute bigram log-probabilities from context. Uses global bigram stats per sequence."""
+    bsz, seq_len = input_ids.shape
+    device = input_ids.device
+    # Build bigram count table from each sequence (Laplace smoothed)
+    prev_ids = input_ids[:, :-1]
+    next_ids = input_ids[:, 1:]
+    counts = torch.ones(bsz, vocab_size, vocab_size, device=device)
+    # Vectorized scatter: count transitions
+    for b in range(bsz):
+        idx = prev_ids[b] * vocab_size + next_ids[b]
+        counts[b].view(-1).scatter_add_(0, idx.long(), torch.ones(seq_len - 1, device=device))
+    # Normalize to probabilities
+    probs = counts / counts.sum(dim=-1, keepdim=True)
+    # Lookup: for each position, P(next | prev_token)
+    logprobs = torch.log(probs)
+    # Gather: logprobs[b, input_ids[b, pos-1], :] for each position
+    prev_tokens = input_ids[:, :-1]  # (bsz, seq_len-1)
+    result = torch.zeros(bsz, seq_len, vocab_size, device=device)
+    result[:, 0] = -math.log(vocab_size)  # uniform for first position
+    for b in range(bsz):
+        result[b, 1:] = logprobs[b, prev_tokens[b]]  # (seq_len-1, vocab_size)
+    return result
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -737,7 +802,11 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        hp = Hyperparameters
+        if hp.use_kronecker_mlp:
+            self.mlp = KroneckerMLP(dim, mlp_mult, num_terms=hp.kronecker_terms)
+        else:
+            self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -827,6 +896,17 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+        ngram_alpha = Hyperparameters.ngram_alpha
+        if ngram_alpha > 0:
+            per_token_loss = F.cross_entropy(logits.float(), targets, reduction="none")
+            with torch.no_grad():
+                bigram_lp = compute_bigram_logprobs(input_ids, logits.size(-1))
+                bigram_lp_flat = bigram_lp[:, 1:].reshape(-1, logits.size(-1))
+                target_bigram_prob = torch.exp(bigram_lp_flat.gather(1, targets.unsqueeze(1)).squeeze(1))
+                weight = (1.0 - ngram_alpha * target_bigram_prob).clamp(min=0.1)
+            return (per_token_loss * weight).mean()
+
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -892,11 +972,18 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=_amp_dtype):
                 logits = base_model.forward_logits(x_batch)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                y_batch.reshape(-1),
-                reduction="none",
-            ).reshape(bsz, seq_len)
+            ngram_alpha = args.ngram_alpha if hasattr(args, 'ngram_alpha') else 0.0
+            if ngram_alpha > 0:
+                neural_lp = F.log_softmax(logits.float(), dim=-1)
+                bigram_lp = compute_bigram_logprobs(x_batch, logits.size(-1))
+                mixed = (1 - ngram_alpha) * neural_lp.exp() + ngram_alpha * bigram_lp.exp()
+                nll = -torch.log(mixed.clamp(min=1e-12)).gather(-1, y_batch.unsqueeze(-1)).squeeze(-1)
+            else:
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz, seq_len)
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
