@@ -19,6 +19,11 @@ import uuid
 import zlib
 from pathlib import Path
 
+try:
+    import pyzstd
+except ImportError:
+    pyzstd = None
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -90,6 +95,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    turboquant_bits = int(os.environ.get("TURBOQUANT_BITS", "3"))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -426,9 +432,242 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         out[name] = out_t
     return out
 
+def _compress(data: bytes, algo: str) -> bytes:
+    if algo == "zstd" and pyzstd is not None:
+        return pyzstd.compress(data, 22)
+    return zlib.compress(data, 9)
+
+def _decompress(data: bytes, algo: str) -> bytes:
+    if algo == "zstd" and pyzstd is not None:
+        return pyzstd.decompress(data)
+    return zlib.decompress(data)
+
+def _quantize_intN(t: Tensor, bits: int) -> tuple[Tensor, Tensor]:
+    """Per-row (2D) or per-tensor (1D/0D) symmetric quantization to N bits."""
+    qmin, qmax = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    t32 = t.float()
+    if t32.ndim == 2:
+        amax = t32.abs().amax(dim=1).clamp_min(1e-12)
+        scale = amax / qmax
+        q = torch.clamp(torch.round(t32 / scale[:, None]), qmin, qmax).to(torch.int8)
+        return q.contiguous(), scale.to(torch.float16).contiguous()
+    amax = t32.abs().max().clamp_min(1e-12)
+    scale = (amax / qmax).float()
+    q = torch.clamp(torch.round(t32 / scale), qmin, qmax).to(torch.int8)
+    return q.contiguous(), scale.contiguous()
+
+def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0,
+    )
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+        # Embeddings → FP16 passthrough (dual-duty, precision-sensitive)
+        if "tok_emb.weight" in name:
+            kept = t.to(dtype=torch.float16).contiguous()
+            passthrough[name] = kept
+            passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+        # Control / small tensors → passthrough
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+        # Route by layer type: MLP → int5, attention → int6
+        stats["num_float_tensors"] += 1
+        bits = 5 if ("mlp.fc." in name or "mlp.proj." in name) else 6
+        q, s = _quantize_intN(t, bits)
+        qmeta[name] = {"scheme": "per_row", "axis": 0, "bits": bits} if s.ndim > 0 else {"bits": bits}
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+    obj: dict[str, object] = {
+        "__quant_format__": "mixed_int56_v1",
+        "quantized": quantized, "scales": scales, "dtypes": dtypes,
+        "passthrough": passthrough, "qmeta": qmeta,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+def dequantize_state_dict_mixed(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    qmeta = obj.get("qmeta", {})
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj["quantized"].items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name]
+        if s.ndim > 0:
+            out[name] = (q.float() * s.float().view(-1, 1)).to(dtype=dtype).contiguous()
+        else:
+            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+# Optimal Lloyd-Max centroids for N(0,1). These minimize MSE for a unit-variance Gaussian.
+LLOYD_CENTROIDS = {
+    2: (-1.5104, -0.4528, 0.4528, 1.5104),
+    3: (-2.152, -1.344, -0.756, -0.245, 0.245, 0.756, 1.344, 2.152),
+    4: (-2.733, -2.069, -1.618, -1.224, -0.857, -0.500, -0.143, 0.0,
+        0.143, 0.500, 0.857, 1.224, 1.618, 2.069, 2.733, 3.100),
+}
+
+TURBOQUANT_BASE_SEED = 42
+_rotation_cache: dict[tuple[int, int], Tensor] = {}
+
+def _random_rotation(dim: int, seed: int) -> Tensor:
+    key = (dim, seed)
+    if key in _rotation_cache:
+        return _rotation_cache[key]
+    gen = torch.Generator().manual_seed(seed)
+    G = torch.randn(dim, dim, generator=gen)
+    Q, R = torch.linalg.qr(G)
+    Q = Q * torch.sign(torch.diag(R)).unsqueeze(0)
+    _rotation_cache[key] = Q
+    return Q
+
+def _tensor_seed(name: str) -> int:
+    return TURBOQUANT_BASE_SEED + (zlib.crc32(name.encode()) & 0x7FFFFFFF)
+
+def _bitpack(indices: Tensor, bits: int) -> Tensor:
+    indices = indices.to(torch.uint8)
+    per_byte = 8 // bits
+    pad = (-len(indices)) % per_byte
+    if pad:
+        indices = torch.cat([indices, torch.zeros(pad, dtype=torch.uint8)])
+    indices = indices.view(-1, per_byte)
+    packed = torch.zeros(len(indices), dtype=torch.uint8)
+    for i in range(per_byte):
+        packed |= indices[:, i] << (i * bits)
+    return packed
+
+def _bitunpack(packed: Tensor, bits: int, count: int) -> Tensor:
+    per_byte = 8 // bits
+    mask = (1 << bits) - 1
+    cols = []
+    for i in range(per_byte):
+        cols.append((packed >> (i * bits)) & mask)
+    return torch.stack(cols, dim=1).reshape(-1)[:count].to(torch.long)
+
+def quantize_state_dict_turboquant(state_dict: dict[str, Tensor], bits: int = 3):
+    centroids = torch.tensor(LLOYD_CENTROIDS[bits], dtype=torch.float32)
+    quantized: dict[str, Tensor] = {}
+    meta: dict[str, dict[str, object]] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0,
+    )
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu().float().contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(tensor)
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+        stats["num_float_tensors"] += 1
+        orig_dtype = str(tensor.dtype).removeprefix("torch.")
+        if t.ndim == 2:
+            rows, cols = t.shape
+            Pi = _random_rotation(cols, _tensor_seed(name))
+            y = t @ Pi.T
+            row_std = y.std(dim=1).clamp_min(1e-12)
+            y_norm = y / row_std.unsqueeze(1)
+            dists = (y_norm.unsqueeze(-1) - centroids.view(1, 1, -1)).abs()
+            indices = dists.argmin(dim=-1).to(torch.uint8).view(-1)
+            packed = _bitpack(indices, bits)
+            quantized[name] = packed
+            meta[name] = {"shape": list(t.shape), "bits": bits, "row_std": row_std.to(torch.float16), "dtype": orig_dtype}
+            stats["int8_payload_bytes"] += packed.numel() + row_std.numel() * 2
+        else:
+            std = t.std().clamp_min(1e-12).item()
+            t_norm = t / std
+            dists = (t_norm.unsqueeze(-1) - centroids.view(1, -1)).abs()
+            indices = dists.argmin(dim=-1).to(torch.uint8).view(-1)
+            packed = _bitpack(indices, bits)
+            quantized[name] = packed
+            meta[name] = {"shape": list(t.shape), "bits": bits, "std": std, "dtype": orig_dtype}
+            stats["int8_payload_bytes"] += packed.numel()
+    obj: dict[str, object] = {
+        "__quant_format__": "turboquant_v1", "quantized": quantized, "meta": meta,
+        "passthrough": passthrough, "seed": TURBOQUANT_BASE_SEED,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+def dequantize_state_dict_turboquant(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, packed in obj["quantized"].items():
+        m = obj["meta"][name]
+        bits = m["bits"]
+        shape = m["shape"]
+        dtype = getattr(torch, m["dtype"])
+        centroids = torch.tensor(LLOYD_CENTROIDS[bits], dtype=torch.float32)
+        numel = 1
+        for s in shape:
+            numel *= s
+        indices = _bitunpack(packed, bits, numel)
+        values = centroids[indices]
+        if len(shape) == 2:
+            rows, cols = shape
+            row_std = m["row_std"].float()
+            values = values.reshape(rows, cols) * row_std.unsqueeze(1)
+            Pi = _random_rotation(cols, _tensor_seed(name))
+            values = values @ Pi  # rotate back
+            out[name] = values.to(dtype).contiguous()
+        else:
+            out[name] = (values.reshape(shape) * m["std"]).to(dtype).contiguous()
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+QUANT_STRATEGIES = {
+    "int8_zlib": (quantize_state_dict_int8, dequantize_state_dict_int8, "zlib", ".int8.ptz"),
+    "mixed_int56_zstd": (quantize_state_dict_mixed, dequantize_state_dict_mixed, "zstd", ".mixed56.ptz"),
+    "turboquant": (
+        lambda sd: quantize_state_dict_turboquant(sd, bits=int(os.environ.get("TURBOQUANT_BITS", "3"))),
+        dequantize_state_dict_turboquant, "zstd", ".turbo.ptz",
+    ),
+}
 
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -1192,64 +1431,59 @@ def main() -> None:
     )
 
     # -----------------------------
-    # SERIALIZATION + ROUNDTRIP VALIDATION
+    # SERIALIZATION + ROUNDTRIP VALIDATION (ALL STRATEGIES)
     # -----------------------------
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model: {model_bytes} bytes")
-        log0(f"Code size: {code_bytes} bytes")
-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        log0(f"Serialized model: {model_bytes} bytes | Code: {code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
-    if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-        log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
-        )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+    trained_sd = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
 
-    if distributed:
-        dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
-        log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
-        q_val_loss, q_val_bpb = eval_val_sliding(
-            args, base_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
+    for method_name, (quant_fn, dequant_fn, comp_algo, ext) in QUANT_STRATEGIES.items():
+        log0(f"\n{'='*60}")
+        log0(f"Evaluating quantization strategy: {method_name}")
+        log0(f"{'='*60}")
+        quant_obj, quant_stats = quant_fn(trained_sd)
+        buf = io.BytesIO()
+        torch.save(quant_obj, buf)
+        raw = buf.getvalue()
+        blob = _compress(raw, comp_algo)
+        filename = f"final_model{ext}"
+        if master_process:
+            with open(filename, "wb") as f:
+                f.write(blob)
+            file_bytes = len(blob)
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"{method_name}: compressed={file_bytes} bytes total_submission={file_bytes + code_bytes} bytes")
+        if distributed:
+            dist.barrier()
+        with open(filename, "rb") as f:
+            blob_disk = f.read()
+        quant_state = torch.load(
+            io.BytesIO(_decompress(blob_disk, comp_algo)), map_location="cpu", weights_only=False,
         )
-    else:
-        log0("final_eval_mode:standard")
-        q_val_loss, q_val_bpb = eval_val(
-            args, model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        base_model.load_state_dict(dequant_fn(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
+            q_val_loss, q_val_bpb = eval_val_sliding(
+                args, base_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
+            )
+        else:
+            q_val_loss, q_val_bpb = eval_val(
+                args, base_model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            )
+        torch.cuda.synchronize()
+        eval_ms = 1000.0 * (time.perf_counter() - t_qeval)
+        log0(f"{method_name}: val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{eval_ms:.0f}ms")
+        log0(f"{method_name}_exact: val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        base_model.load_state_dict(trained_sd, strict=True)
 
     if distributed:
         dist.destroy_process_group()
