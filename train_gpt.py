@@ -700,8 +700,6 @@ def _dequantize_general(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 QUANT_STRATEGIES = {
-    "int8_zlib": (quantize_state_dict_int8, dequantize_state_dict_int8, "zlib", ".int8.ptz"),
-    "mixed_int56_zstd": (quantize_state_dict_mixed, dequantize_state_dict_mixed, "zstd", ".mixed56.ptz"),
     "adaptive_bits": (
         lambda sd: _quantize_general(sd, _adaptive_bit_alloc(sd, Hyperparameters.adaptive_target_bytes),
                                      use_learned_cb=False),
