@@ -738,28 +738,28 @@ class KroneckerMLP(nn.Module):
         self.a1, self.b1 = 32, dim // 32       # 32 * 16 = 512
         self.a2, self.b2 = hidden // 32, 32     # 48 * 32 = 1536
 
-        # Up-projection factors: kron(fc_A[k], fc_B[k]) gives (dim -> hidden)
-        self.fc_A = nn.Parameter(torch.randn(num_terms, self.a1, self.a2) * 0.02)
-        self.fc_B = nn.Parameter(torch.randn(num_terms, self.b1, self.b2) * 0.02)
-        # Down-projection factors: kron(proj_A[k], proj_B[k]) gives (hidden -> dim)
-        self.proj_A = nn.Parameter(torch.zeros(num_terms, self.a2, self.a1))
-        self.proj_B = nn.Parameter(torch.zeros(num_terms, self.b2, self.b1))
+        # Up-projection: A maps a1->a2, B maps b1->b2, so result = A @ x_mat @ B^T
+        self.fc_A = nn.Parameter(torch.randn(num_terms, self.a2, self.a1) * 0.02)
+        self.fc_B = nn.Parameter(torch.randn(num_terms, self.b2, self.b1) * 0.02)
+        # Down-projection: A maps a2->a1, B maps b2->b1
+        self.proj_A = nn.Parameter(torch.zeros(num_terms, self.a1, self.a2))
+        self.proj_B = nn.Parameter(torch.zeros(num_terms, self.b1, self.b2))
 
     def forward(self, x: Tensor) -> Tensor:
-        bsz_seq = x.shape[:-1]  # (batch, seq_len)
-        # Up-projection: x (*, dim) -> h (*, hidden)
-        # x reshaped as (*, a1, b1), compute sum_k (fc_A[k] @ x_mat @ fc_B[k]^T)
+        bsz_seq = x.shape[:-1]
+        # Up: x (*, dim=a1*b1) -> h (*, hidden=a2*b2)
         x_mat = x.reshape(*bsz_seq, self.a1, self.b1)
         h = torch.zeros(*bsz_seq, self.a2, self.b2, device=x.device, dtype=x.dtype)
         for k in range(self.num_terms):
-            h = h + torch.einsum('ia,...ab,jb->...ij', self.fc_A[k].to(x.dtype), x_mat, self.fc_B[k].to(x.dtype))
+            # A[k] @ x_mat @ B[k]^T: (a2,a1) @ (a1,b1) @ (b1,b2) -> (a2,b2)
+            h = h + self.fc_A[k].to(x.dtype) @ x_mat @ self.fc_B[k].to(x.dtype).T
         h = h.reshape(*bsz_seq, self.hidden)
         h = torch.relu(h).square()
-        # Down-projection: h (*, hidden) -> out (*, dim)
+        # Down: h (*, hidden=a2*b2) -> out (*, dim=a1*b1)
         h_mat = h.reshape(*bsz_seq, self.a2, self.b2)
         out = torch.zeros(*bsz_seq, self.a1, self.b1, device=x.device, dtype=x.dtype)
         for k in range(self.num_terms):
-            out = out + torch.einsum('ia,...ab,jb->...ij', self.proj_A[k].to(x.dtype), h_mat, self.proj_B[k].to(x.dtype))
+            out = out + self.proj_A[k].to(x.dtype) @ h_mat @ self.proj_B[k].to(x.dtype).T
         return out.reshape(*bsz_seq, self.dim)
 
 
@@ -896,16 +896,6 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-
-        ngram_alpha = Hyperparameters.ngram_alpha
-        if ngram_alpha > 0:
-            per_token_loss = F.cross_entropy(logits.float(), targets, reduction="none")
-            with torch.no_grad():
-                bigram_lp = compute_bigram_logprobs(input_ids, logits.size(-1))
-                bigram_lp_flat = bigram_lp[:, 1:].reshape(-1, logits.size(-1))
-                target_bigram_prob = torch.exp(bigram_lp_flat.gather(1, targets.unsqueeze(1)).squeeze(1))
-                weight = (1.0 - ngram_alpha * target_bigram_prob).clamp(min=0.1)
-            return (per_token_loss * weight).mean()
 
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
@@ -1329,6 +1319,13 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=_amp_dtype, enabled=True):
                 loss = model(x, y)
+            if args.ngram_alpha > 0:
+                # Reweight loss by bigram predictability (outside compiled graph)
+                with torch.no_grad():
+                    bigram_lp = compute_bigram_logprobs(x, args.vocab_size)
+                    bigram_prob_target = torch.exp(bigram_lp.reshape(-1, args.vocab_size).gather(1, y.reshape(-1).unsqueeze(1)).squeeze(1))
+                    ngram_weight = (1.0 - args.ngram_alpha * bigram_prob_target).clamp(min=0.1).mean()
+                loss = loss * ngram_weight
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
