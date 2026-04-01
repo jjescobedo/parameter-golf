@@ -443,7 +443,6 @@ def _decompress(data: bytes, algo: str) -> bytes:
     return zlib.decompress(data)
 
 def _quantize_intN(t: Tensor, bits: int) -> tuple[Tensor, Tensor]:
-    """Per-row (2D) or per-tensor (1D/0D) symmetric quantization to N bits."""
     qmin, qmax = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
     t32 = t.float()
     if t32.ndim == 2:
@@ -457,12 +456,8 @@ def _quantize_intN(t: Tensor, bits: int) -> tuple[Tensor, Tensor]:
     return q.contiguous(), scale.contiguous()
 
 def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
+    quantized, scales, dtypes, passthrough = {}, {}, {}, {}
+    passthrough_orig_dtypes, qmeta = {}, {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0,
     )
@@ -573,10 +568,7 @@ def _bitunpack(packed: Tensor, bits: int, count: int) -> Tensor:
 
 def quantize_state_dict_turboquant(state_dict: dict[str, Tensor], bits: int = 3):
     centroids = torch.tensor(LLOYD_CENTROIDS[bits], dtype=torch.float32)
-    quantized: dict[str, Tensor] = {}
-    meta: dict[str, dict[str, object]] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
+    quantized, meta, passthrough, passthrough_orig_dtypes = {}, {}, {}, {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0,
     )
@@ -604,11 +596,19 @@ def quantize_state_dict_turboquant(state_dict: dict[str, Tensor], bits: int = 3)
             row_std = y.std(dim=1).clamp_min(1e-12)
             y_norm = y / row_std.unsqueeze(1)
             dists = (y_norm.unsqueeze(-1) - centroids.view(1, 1, -1)).abs()
-            indices = dists.argmin(dim=-1).to(torch.uint8).view(-1)
-            packed = _bitpack(indices, bits)
+            indices = dists.argmin(dim=-1).to(torch.uint8)
+            # QJL residual correction: store sign of quantization residual + per-row norm
+            q_values = centroids[indices.long()]
+            residual = y_norm - q_values
+            res_signs = _bitpack((residual >= 0).to(torch.uint8).view(-1), 1)
+            res_norm = residual.norm(dim=1).to(torch.float16)
+            packed = _bitpack(indices.view(-1), bits)
             quantized[name] = packed
-            meta[name] = {"shape": list(t.shape), "bits": bits, "row_std": row_std.to(torch.float16), "dtype": orig_dtype}
-            stats["int8_payload_bytes"] += packed.numel() + row_std.numel() * 2
+            meta[name] = {
+                "shape": list(t.shape), "bits": bits, "row_std": row_std.to(torch.float16),
+                "dtype": orig_dtype, "res_signs": res_signs, "res_norm": res_norm,
+            }
+            stats["int8_payload_bytes"] += packed.numel() + row_std.numel() * 2 + res_signs.numel() + res_norm.numel() * 2
         else:
             std = t.std().clamp_min(1e-12).item()
             t_norm = t / std
@@ -642,8 +642,14 @@ def dequantize_state_dict_turboquant(obj: dict[str, object]) -> dict[str, Tensor
         values = centroids[indices]
         if len(shape) == 2:
             rows, cols = shape
+            values = values.reshape(rows, cols)
+            # QJL residual correction
+            if "res_signs" in m:
+                signs = _bitunpack(m["res_signs"], 1, numel).float() * 2 - 1  # 0/1 -> -1/+1
+                res_norm = m["res_norm"].float()
+                values = values + signs.reshape(rows, cols) * (res_norm / math.sqrt(cols)).unsqueeze(1)
             row_std = m["row_std"].float()
-            values = values.reshape(rows, cols) * row_std.unsqueeze(1)
+            values = values * row_std.unsqueeze(1)
             Pi = _random_rotation(cols, _tensor_seed(name))
             values = values @ Pi  # rotate back
             out[name] = values.to(dtype).contiguous()
