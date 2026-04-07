@@ -99,6 +99,8 @@ class Hyperparameters:
     factorized_rank = int(os.environ.get("FACTORIZED_RANK", "192"))
     moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", "0"))
     use_conv_ffn = bool(int(os.environ.get("USE_CONV_FFN", "0")))
+    conv_kernel_size = int(os.environ.get("CONV_KERNEL_SIZE", "3"))
+    attn_every_n = int(os.environ.get("ATTN_EVERY_N", "1"))
     use_butterfly_mlp = bool(int(os.environ.get("USE_BUTTERFLY_MLP", "0")))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
@@ -825,31 +827,35 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        has_attention: bool = True,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm()
+        self.has_attention = has_attention
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        if has_attention:
+            self.attn_norm = RMSNorm()
+            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         hp = Hyperparameters
         if hp.use_factorized_ffn:
             self.mlp = FactorizedMLP(dim, mlp_mult, hp.factorized_rank)
         elif hp.moe_num_experts > 0:
             self.mlp = SoftMoEMLP(dim, mlp_mult, hp.moe_num_experts)
         elif hp.use_conv_ffn:
-            self.mlp = ConvMLP(dim, mlp_mult)
+            self.mlp = ConvMLP(dim, mlp_mult, hp.conv_kernel_size)
         elif hp.use_butterfly_mlp:
             self.mlp = ButterflyMLP(dim, mlp_mult)
         else:
             self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        if self.has_attention:
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -880,6 +886,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        hp = Hyperparameters
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -889,6 +896,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    has_attention=(hp.attn_every_n <= 1 or i % hp.attn_every_n == 0),
                 )
                 for i in range(num_layers)
             ]
