@@ -95,9 +95,11 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
-    use_kronecker_mlp = bool(int(os.environ.get("USE_KRONECKER_MLP", "0")))
-    kronecker_terms = int(os.environ.get("KRONECKER_TERMS", "8"))
-    ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.0"))
+    use_factorized_ffn = bool(int(os.environ.get("USE_FACTORIZED_FFN", "0")))
+    factorized_rank = int(os.environ.get("FACTORIZED_RANK", "192"))
+    moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", "0"))
+    use_conv_ffn = bool(int(os.environ.get("USE_CONV_FFN", "0")))
+    use_butterfly_mlp = bool(int(os.environ.get("USE_BUTTERFLY_MLP", "0")))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
 # -----------------------------
@@ -726,66 +728,92 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class KroneckerMLP(nn.Module):
-    """MLP using sum of Kronecker products for extreme parameter efficiency."""
-    def __init__(self, dim: int, mlp_mult: int, num_terms: int = 8):
+class FactorizedMLP(nn.Module):
+    """MLP with bottleneck-rank factorized projections. 50% param savings at rank=192."""
+    def __init__(self, dim: int, mlp_mult: int, rank: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.dim = dim
-        self.hidden = hidden
-        self.num_terms = num_terms
-        # Factor dimensions: dim = a1*b1, hidden = a2*b2
-        self.a1, self.b1 = 32, dim // 32       # 32 * 16 = 512
-        self.a2, self.b2 = hidden // 32, 32     # 48 * 32 = 1536
-
-        # Up-projection: A maps a1->a2, B maps b1->b2, so result = A @ x_mat @ B^T
-        self.fc_A = nn.Parameter(torch.randn(num_terms, self.a2, self.a1) * 0.02)
-        self.fc_B = nn.Parameter(torch.randn(num_terms, self.b2, self.b1) * 0.02)
-        # Down-projection: A maps a2->a1, B maps b2->b1
-        self.proj_A = nn.Parameter(torch.zeros(num_terms, self.a1, self.a2))
-        self.proj_B = nn.Parameter(torch.zeros(num_terms, self.b1, self.b2))
+        self.fc_down = CastedLinear(dim, rank, bias=False)
+        self.fc_up = CastedLinear(rank, hidden, bias=False)
+        self.proj_down = CastedLinear(hidden, rank, bias=False)
+        self.proj_up = CastedLinear(rank, dim, bias=False)
+        self.proj_up._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        bsz_seq = x.shape[:-1]
-        # Up: x (*, dim=a1*b1) -> h (*, hidden=a2*b2)
-        x_mat = x.reshape(*bsz_seq, self.a1, self.b1)
-        h = torch.zeros(*bsz_seq, self.a2, self.b2, device=x.device, dtype=x.dtype)
-        for k in range(self.num_terms):
-            # A[k] @ x_mat @ B[k]^T: (a2,a1) @ (a1,b1) @ (b1,b2) -> (a2,b2)
-            h = h + self.fc_A[k].to(x.dtype) @ x_mat @ self.fc_B[k].to(x.dtype).T
-        h = h.reshape(*bsz_seq, self.hidden)
+        x = self.fc_up(self.fc_down(x))
+        return self.proj_up(self.proj_down(torch.relu(x).square()))
+
+
+class SoftMoEMLP(nn.Module):
+    """Soft Mixture of Experts: all experts process all tokens, weighted by gate."""
+    def __init__(self, dim: int, mlp_mult: int, num_experts: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.expert_hidden = mlp_mult * dim // num_experts
+        self.gate = CastedLinear(dim, num_experts, bias=False)
+        # fc stored as 2D (E*H, dim) for Muon compat — rows [e*H:(e+1)*H] = expert e
+        self.fc = CastedLinear(dim, num_experts * self.expert_hidden, bias=False)
+        # proj stored as 2D (E*dim, H) for Muon compat
+        self.proj_w = nn.Parameter(torch.zeros(num_experts * dim, self.expert_hidden))
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seq, dim = x.shape
+        E, H = self.num_experts, self.expert_hidden
+        scores = torch.softmax(self.gate(x), dim=-1)                    # (B, S, E)
+        h = self.fc(x).reshape(bsz, seq, E, H)                         # (B, S, E, H)
         h = torch.relu(h).square()
-        # Down: h (*, hidden=a2*b2) -> out (*, dim=a1*b1)
-        h_mat = h.reshape(*bsz_seq, self.a2, self.b2)
-        out = torch.zeros(*bsz_seq, self.a1, self.b1, device=x.device, dtype=x.dtype)
-        for k in range(self.num_terms):
-            out = out + self.proj_A[k].to(x.dtype) @ h_mat @ self.proj_B[k].to(x.dtype).T
-        return out.reshape(*bsz_seq, self.dim)
+        h = h * scores.unsqueeze(-1)                                    # (B, S, E, H)
+        pw = self.proj_w.to(dtype=x.dtype).reshape(E, dim, H)          # (E, D, H)
+        return torch.einsum('bseh,edh->bsd', h, pw)
 
 
-def compute_bigram_logprobs(input_ids: Tensor, vocab_size: int) -> Tensor:
-    """Compute bigram log-probabilities from context. Uses global bigram stats per sequence."""
-    bsz, seq_len = input_ids.shape
-    device = input_ids.device
-    # Build bigram count table from each sequence (Laplace smoothed)
-    prev_ids = input_ids[:, :-1]
-    next_ids = input_ids[:, 1:]
-    counts = torch.ones(bsz, vocab_size, vocab_size, device=device)
-    # Vectorized scatter: count transitions
-    for b in range(bsz):
-        idx = prev_ids[b] * vocab_size + next_ids[b]
-        counts[b].view(-1).scatter_add_(0, idx.long(), torch.ones(seq_len - 1, device=device))
-    # Normalize to probabilities
-    probs = counts / counts.sum(dim=-1, keepdim=True)
-    # Lookup: for each position, P(next | prev_token)
-    logprobs = torch.log(probs)
-    # Gather: logprobs[b, input_ids[b, pos-1], :] for each position
-    prev_tokens = input_ids[:, :-1]  # (bsz, seq_len-1)
-    result = torch.zeros(bsz, seq_len, vocab_size, device=device)
-    result[:, 0] = -math.log(vocab_size)  # uniform for first position
-    for b in range(bsz):
-        result[b, 1:] = logprobs[b, prev_tokens[b]]  # (seq_len-1, vocab_size)
-    return result
+class ConvMLP(nn.Module):
+    """Causal depthwise conv + reduced FFN for cheap cross-token mixing."""
+    def __init__(self, dim: int, mlp_mult: int, kernel_size: int = 3):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv1d(dim, dim, kernel_size, groups=dim, bias=False)
+        hidden = mlp_mult * dim
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        xc = F.pad(x.transpose(1, 2), (self.kernel_size - 1, 0))
+        xc = self.conv(xc).transpose(1, 2)
+        x = x + xc
+        return self.proj(torch.relu(self.fc(x)).square())
+
+
+class ButterflyMLP(nn.Module):
+    """Monarch (2-factor butterfly) MLP. ~12x param savings. May break torch.compile."""
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        hidden = mlp_mult * dim
+        p = 16
+        q, r = dim // p, hidden // p
+        self.p, self.q, self.r, self.dim, self.hidden = p, q, r, dim, hidden
+        s = (2.0 / dim) ** 0.5
+        self.fc_R = nn.Parameter(torch.randn(q, p, p) * s)
+        self.fc_L = nn.Parameter(torch.randn(p, r, q) * s)
+        self.proj_R = nn.Parameter(torch.zeros(r, p, p))
+        self.proj_L = nn.Parameter(torch.zeros(p, q, r))
+
+    def forward(self, x: Tensor) -> Tensor:
+        pre, dt = x.shape[:-1], x.dtype
+        p, q, r = self.p, self.q, self.r
+        # fc: dim -> hidden via Monarch factorization
+        u = x.reshape(*pre, p, q).transpose(-2, -1).contiguous()         # (*,q,p)
+        u = torch.einsum('...qi,qij->...qj', u, self.fc_R.to(dt))       # (*,q,p)
+        u = u.transpose(-2, -1).contiguous()                              # (*,p,q)
+        u = torch.einsum('...pq,prq->...pr', u, self.fc_L.to(dt))       # (*,p,r)
+        h = torch.relu(u.reshape(*pre, self.hidden)).square()
+        # proj: hidden -> dim via Monarch factorization
+        v = h.reshape(*pre, p, r).transpose(-2, -1).contiguous()         # (*,r,p)
+        v = torch.einsum('...ri,rij->...rj', v, self.proj_R.to(dt))     # (*,r,p)
+        v = v.transpose(-2, -1).contiguous()                              # (*,p,r)
+        v = torch.einsum('...pr,pqr->...pq', v, self.proj_L.to(dt))     # (*,p,q)
+        return v.reshape(*pre, self.dim)
 
 
 class Block(nn.Module):
@@ -803,8 +831,14 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         hp = Hyperparameters
-        if hp.use_kronecker_mlp:
-            self.mlp = KroneckerMLP(dim, mlp_mult, num_terms=hp.kronecker_terms)
+        if hp.use_factorized_ffn:
+            self.mlp = FactorizedMLP(dim, mlp_mult, hp.factorized_rank)
+        elif hp.moe_num_experts > 0:
+            self.mlp = SoftMoEMLP(dim, mlp_mult, hp.moe_num_experts)
+        elif hp.use_conv_ffn:
+            self.mlp = ConvMLP(dim, mlp_mult)
+        elif hp.use_butterfly_mlp:
+            self.mlp = ButterflyMLP(dim, mlp_mult)
         else:
             self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -962,14 +996,7 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=_amp_dtype):
                 logits = base_model.forward_logits(x_batch)
-            ngram_alpha = args.ngram_alpha if hasattr(args, 'ngram_alpha') else 0.0
-            if ngram_alpha > 0:
-                neural_lp = F.log_softmax(logits.float(), dim=-1)
-                bigram_lp = compute_bigram_logprobs(x_batch, logits.size(-1))
-                mixed = (1 - ngram_alpha) * neural_lp.exp() + ngram_alpha * bigram_lp.exp()
-                nll = -torch.log(mixed.clamp(min=1e-12)).gather(-1, y_batch.unsqueeze(-1)).squeeze(-1)
-            else:
-                nll = F.cross_entropy(
+            nll = F.cross_entropy(
                     logits.reshape(-1, logits.size(-1)).float(),
                     y_batch.reshape(-1),
                     reduction="none",
@@ -1162,7 +1189,7 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1319,13 +1346,6 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=_amp_dtype, enabled=True):
                 loss = model(x, y)
-            if args.ngram_alpha > 0:
-                # Reweight loss by bigram predictability (outside compiled graph)
-                with torch.no_grad():
-                    bigram_lp = compute_bigram_logprobs(x, args.vocab_size)
-                    bigram_prob_target = torch.exp(bigram_lp.reshape(-1, args.vocab_size).gather(1, y.reshape(-1).unsqueeze(1)).squeeze(1))
-                    ngram_weight = (1.0 - args.ngram_alpha * bigram_prob_target).clamp(min=0.1).mean()
-                loss = loss * ngram_weight
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
