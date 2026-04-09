@@ -798,8 +798,8 @@ class Block(nn.Module):
             x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         # Auxiliary stream
         if self.aux_down is not None:
-            if x_aux is None:
-                x_aux = self.aux_down(x)
+            contribution = self.aux_down(x)
+            x_aux = contribution if x_aux is None else x_aux + contribution
             a = F.pad(x_aux.transpose(1, 2), (2, 0))
             x_aux = x_aux + self.aux_conv(a).transpose(1, 2)
             x = x + self.aux_up(x_aux)
@@ -1094,7 +1094,7 @@ def main() -> None:
     else:
         compiled_model = base_model
     _ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
-    if args.recycle_attn_every > 0:
+    if args.recycle_attn_every > 0 or args.aux_stream_dim > 0:
         _ddp_kwargs["find_unused_parameters"] = True
     model: nn.Module = DDP(compiled_model, **_ddp_kwargs) if distributed else compiled_model
 
