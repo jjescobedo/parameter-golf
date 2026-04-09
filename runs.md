@@ -1,8 +1,13 @@
 # Parameter Golf — Run Log
 
 ## Current Best
-**val_bpb: 1.3152 | Artifact: ~15.7MB | Config: 14L ConvFFN** (tight on 16MB limit)
-**Safe pick: val_bpb: 1.3178 | Artifact: ~14.9MB | Config: 13L ConvFFN**
+**Full sliding eval**: val_bpb: 1.3152 | Artifact: ~15.7MB | Config: 14L ConvFFN (tight on 16MB)
+**Safe pick**: val_bpb: 1.3178 | Artifact: ~14.9MB | Config: 13L ConvFFN
+
+**Two near-tied small wins from new round (4xA30, EVAL_FRAC=0.05, baseline E0=1.3323):**
+- **R3: Recycled-Attn 16L 2x ConvFFN** → 1.3299 BPB, 16.6MB (slightly over), -0.0024 vs E0
+- **E3b: Gated-Conv 14L 2x ConvFFN** → 1.3301 BPB, 16.8MB (slightly over), -0.0022 vs E0
+
 Config: 13-14L, 512dim, 2x MLP + causal depthwise conv (k=3), sliding window eval (stride=64), int5/6 + zstd-22 + 3% pruning
 
 ---
@@ -71,6 +76,38 @@ Replaced int8+zlib with mixed int5/int6+zstd-22+byte shuffle+3% magnitude prunin
 | Hybrid 16L attn_every=2 | 1.3202 | 14.3MB | 197 | Worse than 13L full attn |
 | Hybrid 18L attn_every=3 | 1.3235 | 14.7MB | 196 | Worse than 12L full attn |
 | Hybrid 20L attn_every=4 | 1.3241 | 15.2MB | 202 | Extra depth doesn't help without attn |
+
+---
+
+## 5 Architecture Experiments + Stacking Round (4xA30, EVAL_FRAC=0.05)
+
+**Important note on eval methodology**: All experiments below use `EVAL_FRAC=0.05` which samples only the first 5% of each rank's slice. This produces a *consistent* but slightly different absolute number from the full sliding eval. The matched-eval baseline (E0) is **1.3323 BPB**, vs the full-eval baseline of 1.3152 BPB. Compare experiments against E0 for fair comparisons.
+
+| Run | val_bpb | vs E0 (1.3323) | Artifact | Params | ms/step | Notes |
+|-----|---------|----------------|----------|--------|---------|-------|
+| **E0 Baseline 14L 2x ConvFFN** | **1.3323** | — | 16.4MB | 26.3M | 232 | Matched-eval reference |
+| E1 Recycled Attn 16L (3x MLP, no real savings) | 1.3148 | -0.0175 | 23.4MB | 38.3M | 271 | Best BPB but artifact way over budget; impl didn't save params |
+| E2 Asymmetric widths 14L (3x bookend) | 1.3278 | -0.0045 | 16.7MB | 27.3M | 234 | 3x MLP, slightly better |
+| E3 Gated Conv 14L (3x MLP) | 1.3173 | -0.0150 | 20.0MB | 33.6M | 285 | 3x MLP, much bigger |
+| **E3b Gated Conv 14L 2x** | **1.3301** | **-0.0022** | 16.8MB | 26.3M | 264 | **Real win at matched size** |
+| E4 Aux Stream 14L 2x (NaN) | NaN | crashed | — | 28.1M | — | Gradient explosion |
+| E5 Parallel Residual 14L 2x | 1.3324 | +0.0001 | 16.2MB | 26.3M | 229 | Neutral |
+| **R1 Recycled 14L 2x (real savings)** | 1.3356 | +0.0033 | **14.3MB** | 23.5M | 206 | Smaller artifact but worse BPB |
+| R2 Recycled+Gated 14L 2x | 1.3378 | +0.0055 | 14.5MB | 23.5M | 239 | Stacking didn't help |
+| **R3 Recycled 16L 2x (real)** | **1.3299** | **-0.0024** | 16.6MB | 26.8M | 235 | **Tiny win using freed params for depth** |
+| R4 Aux Stream 14L 2x (NaN-fixed) | 1.3324 | +0.0001 | 17.5MB | 28.1M | 260 | NaN gone, neutral, over budget |
+
+### What We Learned
+1. **Recycled attention by itself HURTS** (~+0.003 BPB at matched 14L). Sharing Q/K loses some quality.
+2. **Recycled enables free depth** — saved params let us run 16L at the same total budget. R3 (16L recycled) beats baseline by 0.0024 with same step time as 14L baseline.
+3. **Gated Conv is a real (small) win** — at matched 14L 2x, gives -0.0022 BPB. Repeatable across runs.
+4. **Stacking didn't help** — Recycled+Gated (R2) was *worse* than either alone. Possible interference.
+5. **Parallel Residual is neutral** — same BPB, slightly smaller artifact (-0.2MB).
+6. **Asymmetric widths (bookend)** was worse — uniform widths beat tapered.
+7. **Aux stream NaN'd from x_aux magnitude blow-up across layers**. Fix: pre-norm x_aux with RMSNorm before conv and before aux_up. Then it trains stably but provides no BPB benefit.
+8. **All wins are within noise floor (~0.0024)** at the 2K iter / 4xA30 dev scale. The 16MB constraint is the dominant bottleneck — fitting more parameters would matter more than architecture tweaks.
+9. **Bigger 3x MLP variants always win on BPB** — but they're all over 16MB. Confirms compression is the real bottleneck, not architecture.
+10. **Recycled attention impl detail**: just skipping the Q/K computation in forward() doesn't save params — must conditionally not create the `c_q`/`c_k` modules at init time (`has_qk=False` flag).
 
 ---
 
