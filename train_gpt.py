@@ -1093,7 +1093,10 @@ def main() -> None:
             compiled_model = base_model
     else:
         compiled_model = base_model
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    _ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
+    if args.recycle_attn_every > 0:
+        _ddp_kwargs["find_unused_parameters"] = True
+    model: nn.Module = DDP(compiled_model, **_ddp_kwargs) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
