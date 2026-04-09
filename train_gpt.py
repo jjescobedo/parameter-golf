@@ -108,6 +108,16 @@ class Hyperparameters:
     use_gated_conv = bool(int(os.environ.get("USE_GATED_CONV", "0")))
     aux_stream_dim = int(os.environ.get("AUX_STREAM_DIM", 0))
     parallel_residual_from = int(os.environ.get("PARALLEL_RESIDUAL_FROM", 0))
+    # Overnight sweep additions (default off; see mellow-conjuring-meteor plan)
+    share_attn_every = int(os.environ.get("SHARE_ATTN_EVERY", 0))      # Idea 1
+    nm_sparse = bool(int(os.environ.get("NM_SPARSE", "0")))            # Idea 2
+    kv_heads_schedule = os.environ.get("KV_HEADS_SCHEDULE", "")        # Idea 3
+    hyper_mlp = bool(int(os.environ.get("HYPER_MLP", "0")))            # Idea 4
+    hyper_rank = int(os.environ.get("HYPER_RANK", 16))
+    mobius_mlp = bool(int(os.environ.get("MOBIUS_MLP", "0")))          # Idea 5
+    permute_neurons = bool(int(os.environ.get("PERMUTE_NEURONS", "0")))# Idea 6
+    ghost_kv_layers = int(os.environ.get("GHOST_KV_LAYERS", 0))        # Idea 7
+    impact_prune = bool(int(os.environ.get("IMPACT_PRUNE", "0")))      # Idea 8
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -457,8 +467,14 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
+    # Hypernetwork base MLP (Idea 4): quantize as mlp
+    if "hyper_base" in name:
+        return "mlp"
     if ".mlp." in name or "aux_conv" in name or "conv_gate" in name:
         return "mlp"
+    # Ghost KV conv + proj (Idea 7): quantize as attn
+    if "ghost_conv" in name or "ghost_proj" in name:
+        return "attn"
     if ".attn." in name or "aux_down" in name or "aux_up" in name:
         return "attn"
     if ".proj." in name and ".mlp." not in name:
@@ -635,6 +651,138 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+# -----------------------------
+# Idea 2: 2:4 STRUCTURED SPARSITY
+# -----------------------------
+# Forces exactly 2 of every 4 consecutive weights along the input (column) dim to be zero.
+# Forward masks via straight-through; after opt.step() we physically zero masked entries so
+# they stay zero. Post-training the structural pattern compresses under zstd much better
+# than random magnitude-pruned zeros.
+class MaskedLinear2to4(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__(in_features, out_features, bias=bias)
+        if in_features % 4 != 0:
+            raise ValueError(f"MaskedLinear2to4 requires in_features%4==0 got {in_features}")
+
+    def _compute_mask(self, W: Tensor) -> Tensor:
+        out, inp = W.shape
+        w4 = W.abs().reshape(out, inp // 4, 4)
+        _, idx = torch.topk(w4, k=2, dim=-1)
+        mask = torch.zeros_like(w4)
+        mask.scatter_(-1, idx, 1.0)
+        return mask.reshape(out, inp)
+
+    @torch.no_grad()
+    def apply_mask_to_weight(self) -> None:
+        mask = self._compute_mask(self.weight.detach()).to(self.weight.dtype)
+        self.weight.data.mul_(mask)
+
+    def forward(self, x: Tensor) -> Tensor:
+        W_cast = self.weight.to(x.dtype)
+        mask = self._compute_mask(W_cast).to(x.dtype)
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, W_cast * mask, bias)
+
+
+def refresh_nm_masks(model: nn.Module) -> None:
+    for m in model.modules():
+        if isinstance(m, MaskedLinear2to4):
+            m.apply_mask_to_weight()
+
+
+# -----------------------------
+# Idea 6: ISOMORPHIC NEURON PERMUTATION (compression-only, zero quality impact)
+# -----------------------------
+# For each MLP block, sort the rows of fc.weight (hidden dim) by a 1-D similarity key
+# (row mean), then correspondingly permute the columns of proj.weight. The composed
+# function proj @ act(fc(x)) is mathematically unchanged, but byte-similar rows end
+# up adjacent so zstd's LZ77 dictionary catches more repeats.
+@torch.no_grad()
+def permute_mlp_neurons(state_dict: dict[str, Tensor]) -> None:
+    # Operates in place on a cpu state dict.
+    # Match "blocks.N.mlp.fc.weight" <-> "blocks.N.mlp.proj.weight".
+    keys = list(state_dict.keys())
+    for fc_key in keys:
+        if not fc_key.endswith(".mlp.fc.weight"):
+            continue
+        proj_key = fc_key.replace(".mlp.fc.weight", ".mlp.proj.weight")
+        if proj_key not in state_dict:
+            continue
+        fc_w = state_dict[fc_key]      # (hidden, dim_or_lane)
+        proj_w = state_dict[proj_key]  # (dim_or_lane, hidden)
+        if fc_w.ndim != 2 or proj_w.ndim != 2 or fc_w.shape[0] != proj_w.shape[1]:
+            continue
+        # 1-D sort key per hidden neuron: row mean is cheap, stable, and byte-correlated.
+        key = fc_w.float().mean(dim=1)
+        perm = torch.argsort(key)
+        state_dict[fc_key] = fc_w[perm].contiguous()
+        state_dict[proj_key] = proj_w[:, perm].contiguous()
+
+
+# -----------------------------
+# Idea 8: WANDA-STYLE IMPACT PRUNING
+# -----------------------------
+# Saliency = |W_ij| * ||X_j||_2 where X_j is the calibration activation norm on
+# column j of the linear's input. We register forward hooks on every nn.Linear /
+# CastedLinear in the model, run a handful of validation batches, then prune the
+# lowest-saliency fraction of each 2D weight (per-output-row).
+@torch.no_grad()
+def wanda_prune(model: nn.Module, data_iter, num_batches: int, prune_frac: float, device) -> None:
+    col_norms: dict[str, Tensor] = {}
+    hooks = []
+    name_by_mod: dict[int, str] = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            name_by_mod[id(mod)] = name
+            def make_hook(mname: str):
+                def hook(m, inp, out):
+                    x = inp[0]
+                    # Flatten batch/seq → N x in_features
+                    x2 = x.reshape(-1, x.shape[-1]).float()
+                    sq = (x2 * x2).sum(dim=0)  # (in_features,)
+                    if mname in col_norms:
+                        col_norms[mname] = col_norms[mname] + sq
+                    else:
+                        col_norms[mname] = sq
+                return hook
+            hooks.append(mod.register_forward_hook(make_hook(name)))
+    # Run calibration forward passes (no grad)
+    model.eval()
+    seen = 0
+    for batch in data_iter:
+        if seen >= num_batches:
+            break
+        x, y = batch
+        with torch.autocast(device_type="cuda", dtype=_amp_dtype, enabled=True):
+            _ = model(x, y)
+        seen += 1
+    for h in hooks:
+        h.remove()
+    # Apply saliency-based pruning (only to block MLP layers; skip embedding/head/attn).
+    n_pruned = 0
+    for name, mod in model.named_modules():
+        if not isinstance(mod, nn.Linear):
+            continue
+        if ".mlp." not in name:
+            continue
+        if name not in col_norms:
+            continue
+        W = mod.weight.data  # (out, in)
+        if W.ndim != 2 or W.numel() < 65536:
+            continue
+        x_norm = col_norms[name].sqrt().to(W.device)  # (in,)
+        saliency = W.abs().float() * x_norm[None, :]
+        # Per-row: keep top (1 - prune_frac) by saliency
+        k_keep = max(1, int((1.0 - prune_frac) * W.shape[1]))
+        vals, _ = torch.topk(saliency, k=k_keep, dim=1)
+        thresh = vals[:, -1:].to(W.dtype)
+        mask = saliency.to(W.dtype) >= thresh
+        W.mul_(mask.to(W.dtype))
+        n_pruned += 1
+    model.train()
+    return n_pruned
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -683,6 +831,7 @@ class CausalSelfAttention(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         has_qk: bool = True,
+        ghost_kv: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -696,23 +845,48 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
         self.has_qk = has_qk
+        self.ghost_kv = ghost_kv
         if has_qk:
             self.c_q = CastedLinear(dim, dim, bias=False)
-            self.c_k = CastedLinear(dim, kv_dim, bias=False)
+            if not ghost_kv:
+                self.c_k = CastedLinear(dim, kv_dim, bias=False)
             self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
             self.rotary = Rotary(self.head_dim, base=rope_base)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        if ghost_kv:
+            # Idea 7: replace c_k/c_v with a cheap depthwise causal conv + small linear.
+            # Depthwise Conv1d(dim, dim, k=3, groups=dim) has only dim*3 params (~1.5K @ dim=512).
+            # One linear projects the conv output to kv_dim*2 (concatenated k and v).
+            self.ghost_conv = nn.Conv1d(dim, dim, 3, groups=dim, bias=False)
+            self.ghost_proj = CastedLinear(dim, kv_dim * 2, bias=False)
+        else:
+            self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
 
+    def _ghost_kv(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        # x: (B, T, dim). Returns (k, v) each shaped (B, num_kv_heads, T, head_dim).
+        xc = F.pad(x.transpose(1, 2), (2, 0))  # causal left-pad by k-1=2
+        xc = self.ghost_conv(xc).transpose(1, 2)  # (B, T, dim)
+        kv = self.ghost_proj(xc)  # (B, T, kv_dim*2)
+        kv_dim = self.num_kv_heads * self.head_dim
+        k_flat, v_flat = kv[..., :kv_dim], kv[..., kv_dim:]
+        bsz, seqlen = x.shape[0], x.shape[1]
+        k = k_flat.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v_flat.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        return k, v
+
     def forward(self, x: Tensor, cached_qk: tuple | None = None) -> tuple[Tensor, Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        if self.ghost_kv:
+            k, v = self._ghost_kv(x)
+        else:
+            v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         if cached_qk is not None:
             q, k = cached_qk  # reuse Q, K from a previous layer
         else:
             q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-            k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            if not self.ghost_kv:
+                k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
             q, k = _rms_norm(q, (q.size(-1),)), _rms_norm(k, (k.size(-1),))
             cos, sin = self.rotary(seqlen, x.device, q.dtype)
             q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -734,12 +908,20 @@ def _resolve_hidden(dim: int, mlp_mult: int, hidden_override: int = 0) -> int:
     return hp.mlp_hidden_dim if hp.mlp_hidden_dim > 0 else mlp_mult * dim
 
 
+def _mlp_linear_cls() -> type:
+    # Idea 2: swap in 2:4 masked linear when NM_SPARSE is set
+    return MaskedLinear2to4 if Hyperparameters.nm_sparse else CastedLinear
+
+
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int, hidden_override: int = 0):
+    def __init__(self, dim: int, mlp_mult: int, hidden_override: int = 0, lane_dim: int = 0):
         super().__init__()
-        hidden = _resolve_hidden(dim, mlp_mult, hidden_override)
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        # Idea 5: Möbius lane — MLP only reads/writes a contiguous slice of dim
+        self.lane_dim = lane_dim if lane_dim > 0 else dim
+        hidden = _resolve_hidden(self.lane_dim, mlp_mult, hidden_override)
+        LC = _mlp_linear_cls()
+        self.fc = LC(self.lane_dim, hidden, bias=False)
+        self.proj = LC(hidden, self.lane_dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -748,15 +930,18 @@ class MLP(nn.Module):
 
 class ConvMLP(nn.Module):
     """Causal depthwise conv + optional SwiGLU gate + reduced FFN."""
-    def __init__(self, dim: int, mlp_mult: int, kernel_size: int = 3, hidden_override: int = 0):
+    def __init__(self, dim: int, mlp_mult: int, kernel_size: int = 3, hidden_override: int = 0, lane_dim: int = 0):
         super().__init__()
         self.kernel_size = kernel_size
-        self.conv = nn.Conv1d(dim, dim, kernel_size, groups=dim, bias=False)
+        self.lane_dim = lane_dim if lane_dim > 0 else dim
+        ld = self.lane_dim
+        self.conv = nn.Conv1d(ld, ld, kernel_size, groups=ld, bias=False)
         hp = Hyperparameters
-        self.conv_gate = nn.Conv1d(dim, dim, kernel_size, groups=dim, bias=False) if hp.use_gated_conv else None
-        hidden = _resolve_hidden(dim, mlp_mult, hidden_override)
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.conv_gate = nn.Conv1d(ld, ld, kernel_size, groups=ld, bias=False) if hp.use_gated_conv else None
+        hidden = _resolve_hidden(ld, mlp_mult, hidden_override)
+        LC = _mlp_linear_cls()
+        self.fc = LC(ld, hidden, bias=False)
+        self.proj = LC(hidden, ld, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -769,18 +954,71 @@ class ConvMLP(nn.Module):
         return self.proj(torch.relu(self.fc(x)).square())
 
 
+# -----------------------------
+# Idea 4: HYPERNETWORK-GENERATED MLP WEIGHTS
+# -----------------------------
+# Shared base W_fc_base, W_proj_base across all layers. Per-layer tiny low-rank delta
+# W_fc_i = W_fc_base + U_fc_i @ V_fc_i.T . The base tensors live on a module-level
+# container to avoid duplication; per-layer HyperMLP only holds the small U/V adapters.
+class HyperBase(nn.Module):
+    def __init__(self, dim: int, hidden: int):
+        super().__init__()
+        self.fc_base = CastedLinear(dim, hidden, bias=False)
+        self.proj_base = CastedLinear(hidden, dim, bias=False)
+        self.proj_base._zero_init = True
+
+
+class HyperMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int, base: HyperBase, rank: int):
+        super().__init__()
+        hidden = _resolve_hidden(dim, mlp_mult, 0)
+        self.base = [base]  # wrap in list so it's not a submodule (no param duplication)
+        self.rank = rank
+        # Per-layer adapters; ~(dim+hidden)*rank params each. At r=16 dim=512 hidden=1024:
+        # (512+1024)*16*2 = ~49K params/layer, vs ~1.5M params/layer for full MLP.
+        self.fc_u = nn.Parameter(torch.zeros(hidden, rank, dtype=torch.float32))
+        self.fc_v = nn.Parameter(torch.zeros(dim, rank, dtype=torch.float32))
+        self.proj_u = nn.Parameter(torch.zeros(dim, rank, dtype=torch.float32))
+        self.proj_v = nn.Parameter(torch.zeros(hidden, rank, dtype=torch.float32))
+        nn.init.normal_(self.fc_u, std=0.02)
+        nn.init.normal_(self.fc_v, std=0.02)
+        # proj_u/proj_v stay at zero init (matches the proj._zero_init convention).
+
+    def forward(self, x: Tensor) -> Tensor:
+        base = self.base[0]
+        W_fc = base.fc_base.weight.to(x.dtype) + (self.fc_u @ self.fc_v.T).to(x.dtype)
+        W_proj = base.proj_base.weight.to(x.dtype) + (self.proj_u @ self.proj_v.T).to(x.dtype)
+        h = torch.relu(F.linear(x, W_fc)).square()
+        return F.linear(h, W_proj)
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, parallel: bool = False,
-                 mlp_hidden: int = 0, aux_dim: int = 0, has_own_qk: bool = True):
+                 mlp_hidden: int = 0, aux_dim: int = 0, has_own_qk: bool = True,
+                 ghost_kv: bool = False, lane_start: int = 0, lane_end: int = 0,
+                 hyper_base: "HyperBase | None" = None):
         super().__init__()
         self.parallel = parallel
         self.attn_norm, self.mlp_norm = RMSNorm(), RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, has_qk=has_own_qk)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                        has_qk=has_own_qk, ghost_kv=ghost_kv)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        # Idea 5: Möbius lane bounds (0,0 = full-width, no slicing)
+        self.lane_start = lane_start
+        self.lane_end = lane_end if lane_end > 0 else dim
+        lane_dim = self.lane_end - self.lane_start
+        self.mobius = (lane_start != 0 or (lane_end > 0 and lane_end != dim))
         hp = Hyperparameters
-        self.mlp = ConvMLP(dim, mlp_mult, hp.conv_kernel_size, mlp_hidden) if hp.use_conv_ffn else MLP(dim, mlp_mult, mlp_hidden)
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        mlp_dim = lane_dim if self.mobius else dim
+        if hyper_base is not None:
+            # Idea 4: hypernet MLP uses shared base
+            self.mlp = HyperMLP(mlp_dim, mlp_mult, hyper_base, hp.hyper_rank)
+        elif hp.use_conv_ffn:
+            self.mlp = ConvMLP(mlp_dim, mlp_mult, hp.conv_kernel_size, mlp_hidden, lane_dim=mlp_dim)
+        else:
+            self.mlp = MLP(mlp_dim, mlp_mult, mlp_hidden, lane_dim=mlp_dim)
+        self.mlp_scale = nn.Parameter(torch.ones(mlp_dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         # Auxiliary stream
         if aux_dim > 0:
@@ -791,17 +1029,26 @@ class Block(nn.Module):
         else:
             self.aux_down = None
 
+    def _apply_mlp(self, x_in: Tensor) -> Tensor:
+        # Idea 5: Möbius slice — feed only the lane slice to the MLP and scatter-add back.
+        if not self.mobius:
+            return self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_in))
+        lane = x_in[..., self.lane_start:self.lane_end]
+        out_lane = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * self.mlp(self.mlp_norm(lane))
+        out = torch.zeros_like(x_in)
+        out[..., self.lane_start:self.lane_end] = out_lane
+        return out
+
     def forward(self, x: Tensor, x0: Tensor, cached_qk: tuple | None = None,
                 x_aux: Tensor | None = None) -> tuple[Tensor, tuple, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, q, k = self.attn(self.attn_norm(x), cached_qk=cached_qk)
         if self.parallel:
-            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out \
-                  + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out + self._apply_mlp(x)
         else:
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            x = x + self._apply_mlp(x)
         # Auxiliary stream
         if self.aux_down is not None:
             contribution = self.aux_down(x)
@@ -832,13 +1079,45 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         widths = [int(w) for w in hp.mlp_widths.split(",")] if hp.mlp_widths else []
+        # Idea 3: per-layer num_kv_heads schedule
+        kv_sched = [int(x) for x in hp.kv_heads_schedule.split(",")] if hp.kv_heads_schedule else []
+        def kv_for(i: int) -> int:
+            return kv_sched[i] if i < len(kv_sched) else num_kv_heads
+        # Idea 4: one shared hyper base across all layers (only if enabled)
+        self.hyper_base: HyperBase | None = None
+        if hp.hyper_mlp:
+            hyper_hidden = _resolve_hidden(model_dim, mlp_mult, 0)
+            self.hyper_base = HyperBase(model_dim, hyper_hidden)
+        # Idea 5: Möbius alternating half-lanes
+        def lane_for(i: int) -> tuple[int, int]:
+            if not hp.mobius_mlp:
+                return 0, 0
+            half = model_dim // 2
+            return (0, half) if (i % 2 == 0) else (half, model_dim)
+        # Idea 7: first N layers get ghost KV (conv-derived K/V)
+        def ghost_for(i: int) -> bool:
+            return hp.ghost_kv_layers > 0 and i < hp.ghost_kv_layers
+
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+            Block(model_dim, num_heads, kv_for(i), mlp_mult, rope_base, qk_gain_init,
                   parallel=(hp.parallel_residual_from > 0 and i >= hp.parallel_residual_from),
                   mlp_hidden=widths[i] if i < len(widths) else 0,
                   aux_dim=hp.aux_stream_dim,
-                  has_own_qk=not (hp.recycle_attn_every > 0 and i % hp.recycle_attn_every != 0))
+                  has_own_qk=not (hp.recycle_attn_every > 0 and i % hp.recycle_attn_every != 0),
+                  ghost_kv=ghost_for(i),
+                  lane_start=lane_for(i)[0], lane_end=lane_for(i)[1],
+                  hyper_base=self.hyper_base)
             for i in range(num_layers)])
+        # Idea 1: share attention weights across groups of N layers (post-construction reassign)
+        if hp.share_attn_every > 1:
+            for g_start in range(0, num_layers, hp.share_attn_every):
+                anchor = self.blocks[g_start].attn
+                for j in range(g_start + 1, min(g_start + hp.share_attn_every, num_layers)):
+                    # Only share if shapes match (num_kv_heads schedule may force different shapes)
+                    if (self.blocks[j].attn.num_kv_heads == anchor.num_kv_heads
+                            and self.blocks[j].attn.num_heads == anchor.num_heads
+                            and self.blocks[j].attn.ghost_kv == anchor.ghost_kv):
+                        self.blocks[j].attn = anchor
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None: self.lm_head._zero_init = True
@@ -1090,21 +1369,28 @@ def main() -> None:
     )
     base_model = GPT(**_model_kwargs).to(device).to(_amp_dtype)
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, MaskedLinear2to4)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     # Disable torch.compile on PyTorch < 2.4 due to eval-mode bugs
     _pt_version = tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2])
     if cap[0] >= 7 and _pt_version >= (2, 4):
         try:
-            _fg = not (args.recycle_attn_every > 0 or args.aux_stream_dim > 0)
+            # Disable fullgraph for any feature that introduces dynamic control flow,
+            # module reuse, or mask recompute.
+            _fg = not (args.recycle_attn_every > 0 or args.aux_stream_dim > 0
+                       or args.share_attn_every > 1 or args.nm_sparse
+                       or args.hyper_mlp or args.mobius_mlp or args.ghost_kv_layers > 0)
             compiled_model = torch.compile(base_model, dynamic=False, fullgraph=_fg)
         except Exception:
             compiled_model = base_model
     else:
         compiled_model = base_model
     _ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
-    if args.aux_stream_dim > 0:
+    # Shared params (Idea 1), hyper base (Idea 4), Möbius (Idea 5) may leave params
+    # unused on some ranks — DDP needs find_unused_parameters to tolerate that.
+    if (args.aux_stream_dim > 0 or args.share_attn_every > 1 or args.hyper_mlp
+            or args.mobius_mlp):
         _ddp_kwargs["find_unused_parameters"] = True
     model: nn.Module = DDP(compiled_model, **_ddp_kwargs) if distributed else compiled_model
 
@@ -1126,6 +1412,13 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # Idea 4: hyper_base lives outside base_model.blocks; add its weights to Muon.
+    if getattr(base_model, "hyper_base", None) is not None:
+        for name, p in base_model.hyper_base.named_parameters():
+            if p.ndim == 2:
+                matrix_params.append(p)
+            else:
+                scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1214,6 +1507,8 @@ def main() -> None:
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
+            if args.nm_sparse:
+                refresh_nm_masks(base_model)
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
@@ -1296,6 +1591,9 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        # Idea 2: enforce 2:4 sparsity pattern after the optimizer updates weights.
+        if args.nm_sparse:
+            refresh_nm_masks(base_model)
         zero_grad_all()
 
         step += 1
@@ -1336,8 +1634,25 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    # Magnitude pruning: zero out smallest weights to improve compression
-    if args.prune_frac > 0:
+    # Pruning: either Wanda-style (Idea 8) or legacy magnitude pruning.
+    if args.impact_prune and args.prune_frac > 0:
+        def _calib_iter():
+            calib_loader = DistributedTokenLoader(args.val_files, rank, world_size, device)
+            for _ in range(8):
+                yield calib_loader.next_batch(min(args.val_batch_size, 131072), args.train_seq_len, 1)
+        try:
+            n = wanda_prune(base_model, _calib_iter(), num_batches=8,
+                            prune_frac=args.prune_frac, device=device)
+            log0(f"wanda_prune: pruned {n} mlp linears at frac={args.prune_frac}")
+        except Exception as e:
+            log0(f"wanda_prune failed ({e}); falling back to magnitude prune")
+            with torch.no_grad():
+                for name, param in base_model.named_parameters():
+                    if param.ndim == 2 and param.numel() > 65536:
+                        threshold = torch.quantile(param.abs().float().flatten(), args.prune_frac)
+                        mask = param.abs() < threshold
+                        param.masked_fill_(mask, 0.0)
+    elif args.prune_frac > 0:
         with torch.no_grad():
             for name, param in base_model.named_parameters():
                 if param.ndim == 2 and param.numel() > 65536:
@@ -1347,6 +1662,10 @@ def main() -> None:
 
     # Mixed int5/int6 quantization + byte shuffle + zstd/zlib compression
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+    # Idea 6: permute MLP neurons to improve compressibility (mathematically identical)
+    if args.permute_neurons:
+        permute_mlp_neurons(sd_cpu)
+        log0("permute_neurons: applied isomorphic MLP neuron permutation")
     quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
