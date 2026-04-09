@@ -95,14 +95,14 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
-    use_factorized_ffn = bool(int(os.environ.get("USE_FACTORIZED_FFN", "0")))
-    factorized_rank = int(os.environ.get("FACTORIZED_RANK", "192"))
-    moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", "0"))
     use_conv_ffn = bool(int(os.environ.get("USE_CONV_FFN", "0")))
     conv_kernel_size = int(os.environ.get("CONV_KERNEL_SIZE", "3"))
-    attn_every_n = int(os.environ.get("ATTN_EVERY_N", "1"))
-    use_butterfly_mlp = bool(int(os.environ.get("USE_BUTTERFLY_MLP", "0")))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    mlp_hidden_dim = int(os.environ.get("MLP_HIDDEN_DIM", 0))
+    use_lora_towers = bool(int(os.environ.get("USE_LORA_TOWERS", "0")))
+    lora_rank = int(os.environ.get("LORA_RANK", 64))
+    lora_gate_warmup_frac = float(os.environ.get("LORA_GATE_WARMUP_FRAC", 0.3))
+    eval_frac = float(os.environ.get("EVAL_FRAC", "1.0"))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -452,9 +452,11 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if ".mlp." in name:
+    if "shared_mlp" in name or ".mlp." in name or "lora_fc" in name or "lora_mlp_proj" in name:
         return "mlp"
-    if ".attn." in name or (".proj." in name and ".mlp." not in name):
+    if "shared_attn" in name or ".attn." in name or "lora_q_" in name or "lora_k_" in name or "lora_v_" in name or "lora_proj_" in name:
+        return "attn"
+    if ".proj." in name and ".mlp." not in name:
         return "attn"
     return "other"
 
@@ -720,7 +722,7 @@ class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = Hyperparameters.mlp_hidden_dim if Hyperparameters.mlp_hidden_dim > 0 else mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -730,52 +732,13 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class FactorizedMLP(nn.Module):
-    """MLP with bottleneck-rank factorized projections. 50% param savings at rank=192."""
-    def __init__(self, dim: int, mlp_mult: int, rank: int):
-        super().__init__()
-        hidden = mlp_mult * dim
-        self.fc_down = CastedLinear(dim, rank, bias=False)
-        self.fc_up = CastedLinear(rank, hidden, bias=False)
-        self.proj_down = CastedLinear(hidden, rank, bias=False)
-        self.proj_up = CastedLinear(rank, dim, bias=False)
-        self.proj_up._zero_init = True
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.fc_up(self.fc_down(x))
-        return self.proj_up(self.proj_down(torch.relu(x).square()))
-
-
-class SoftMoEMLP(nn.Module):
-    """Soft Mixture of Experts: all experts process all tokens, weighted by gate."""
-    def __init__(self, dim: int, mlp_mult: int, num_experts: int):
-        super().__init__()
-        self.num_experts = num_experts
-        self.expert_hidden = mlp_mult * dim // num_experts
-        self.gate = CastedLinear(dim, num_experts, bias=False)
-        # fc stored as 2D (E*H, dim) for Muon compat — rows [e*H:(e+1)*H] = expert e
-        self.fc = CastedLinear(dim, num_experts * self.expert_hidden, bias=False)
-        # proj stored as 2D (E*dim, H) for Muon compat
-        self.proj_w = nn.Parameter(torch.zeros(num_experts * dim, self.expert_hidden))
-
-    def forward(self, x: Tensor) -> Tensor:
-        bsz, seq, dim = x.shape
-        E, H = self.num_experts, self.expert_hidden
-        scores = torch.softmax(self.gate(x), dim=-1)                    # (B, S, E)
-        h = self.fc(x).reshape(bsz, seq, E, H)                         # (B, S, E, H)
-        h = torch.relu(h).square()
-        h = h * scores.unsqueeze(-1)                                    # (B, S, E, H)
-        pw = self.proj_w.to(dtype=x.dtype).reshape(E, dim, H)          # (E, D, H)
-        return torch.einsum('bseh,edh->bsd', h, pw)
-
-
 class ConvMLP(nn.Module):
     """Causal depthwise conv + reduced FFN for cheap cross-token mixing."""
     def __init__(self, dim: int, mlp_mult: int, kernel_size: int = 3):
         super().__init__()
         self.kernel_size = kernel_size
         self.conv = nn.Conv1d(dim, dim, kernel_size, groups=dim, bias=False)
-        hidden = mlp_mult * dim
+        hidden = Hyperparameters.mlp_hidden_dim if Hyperparameters.mlp_hidden_dim > 0 else mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -787,124 +750,158 @@ class ConvMLP(nn.Module):
         return self.proj(torch.relu(self.fc(x)).square())
 
 
-class ButterflyMLP(nn.Module):
-    """Monarch (2-factor butterfly) MLP. ~12x param savings. May break torch.compile."""
-    def __init__(self, dim: int, mlp_mult: int):
-        super().__init__()
-        hidden = mlp_mult * dim
-        p = 16
-        q, r = dim // p, hidden // p
-        self.p, self.q, self.r, self.dim, self.hidden = p, q, r, dim, hidden
-        s = (2.0 / dim) ** 0.5
-        self.fc_R = nn.Parameter(torch.randn(q, p, p) * s)
-        self.fc_L = nn.Parameter(torch.randn(p, r, q) * s)
-        self.proj_R = nn.Parameter(torch.zeros(r, p, p))
-        self.proj_L = nn.Parameter(torch.zeros(p, q, r))
-
-    def forward(self, x: Tensor) -> Tensor:
-        pre, dt = x.shape[:-1], x.dtype
-        p, q, r = self.p, self.q, self.r
-        # fc: dim -> hidden via Monarch factorization
-        u = x.reshape(*pre, p, q).transpose(-2, -1).contiguous()         # (*,q,p)
-        u = torch.einsum('...qi,qij->...qj', u, self.fc_R.to(dt))       # (*,q,p)
-        u = u.transpose(-2, -1).contiguous()                              # (*,p,q)
-        u = torch.einsum('...pq,prq->...pr', u, self.fc_L.to(dt))       # (*,p,r)
-        h = torch.relu(u.reshape(*pre, self.hidden)).square()
-        # proj: hidden -> dim via Monarch factorization
-        v = h.reshape(*pre, p, r).transpose(-2, -1).contiguous()         # (*,r,p)
-        v = torch.einsum('...ri,rij->...rj', v, self.proj_R.to(dt))     # (*,r,p)
-        v = v.transpose(-2, -1).contiguous()                              # (*,p,r)
-        v = torch.einsum('...pr,pqr->...pq', v, self.proj_L.to(dt))     # (*,p,q)
-        return v.reshape(*pre, self.dim)
-
-
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-        has_attention: bool = True,
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float):
         super().__init__()
-        self.has_attention = has_attention
-        self.mlp_norm = RMSNorm()
-        if has_attention:
-            self.attn_norm = RMSNorm()
-            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_norm, self.mlp_norm = RMSNorm(), RMSNorm()
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         hp = Hyperparameters
-        if hp.use_factorized_ffn:
-            self.mlp = FactorizedMLP(dim, mlp_mult, hp.factorized_rank)
-        elif hp.moe_num_experts > 0:
-            self.mlp = SoftMoEMLP(dim, mlp_mult, hp.moe_num_experts)
-        elif hp.use_conv_ffn:
-            self.mlp = ConvMLP(dim, mlp_mult, hp.conv_kernel_size)
-        elif hp.use_butterfly_mlp:
-            self.mlp = ButterflyMLP(dim, mlp_mult)
-        else:
-            self.mlp = MLP(dim, mlp_mult)
+        self.mlp = ConvMLP(dim, mlp_mult, hp.conv_kernel_size) if hp.use_conv_ffn else MLP(dim, mlp_mult)
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        if self.has_attention:
-            attn_out = self.attn(self.attn_norm(x))
-            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
-class GPT(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        num_layers: int,
-        model_dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        tie_embeddings: bool,
-        tied_embed_init_std: float,
-        logit_softcap: float,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+class LoRABlock(nn.Module):
+    """Block with shared base weights + per-layer low-rank residuals."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, rank: int):
         super().__init__()
-        if logit_softcap <= 0.0:
-            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        self.tie_embeddings = tie_embeddings
-        self.tied_embed_init_std = tied_embed_init_std
+        hp = Hyperparameters
+        self.attn_norm, self.mlp_norm = RMSNorm(), RMSNorm()
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
+        self.head_dim = dim // num_heads
+        kv_dim, hidden = num_kv_heads * self.head_dim, (hp.mlp_hidden_dim if hp.mlp_hidden_dim > 0 else mlp_mult * dim)
+        CL = lambda i, o: CastedLinear(i, o, bias=False)
+        self.lora_q_A, self.lora_q_B = CL(dim, rank), CL(rank, dim)
+        self.lora_k_A, self.lora_k_B = CL(dim, rank), CL(rank, kv_dim)
+        self.lora_v_A, self.lora_v_B = CL(dim, rank), CL(rank, kv_dim)
+        self.lora_proj_A, self.lora_proj_B = CL(dim, rank), CL(rank, dim)
+        self.lora_fc_A, self.lora_fc_B = CL(dim, rank), CL(rank, hidden)
+        self.lora_mlp_proj_A, self.lora_mlp_proj_B = CL(hidden, rank), CL(rank, dim)
+        for n, p in self.named_parameters():
+            if "_B." in n and "weight" in n:
+                nn.init.zeros_(p)
+        self.conv = nn.Conv1d(dim, dim, hp.conv_kernel_size, groups=dim, bias=False) if hp.use_conv_ffn else None
+        self.kernel_size = hp.conv_kernel_size if hp.use_conv_ffn else 0
+
+    def forward(self, x: Tensor, x0: Tensor, sa: CausalSelfAttention, sm: MLP, gate: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        h = self.attn_norm(x)
+        bsz, seqlen, dim = h.shape
+        q = sa.c_q(h) + gate * self.lora_q_B(self.lora_q_A(h))
+        k = sa.c_k(h) + gate * self.lora_k_B(self.lora_k_A(h))
+        v = sa.c_v(h) + gate * self.lora_v_B(self.lora_v_A(h))
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q, k = _rms_norm(q, (q.size(-1),)), _rms_norm(k, (k.size(-1),))
+        cos, sin = sa.rotary(seqlen, x.device, q.dtype)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        if self.num_kv_heads != self.num_heads:
+            rep = self.num_heads // self.num_kv_heads
+            k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * (sa.proj(y) + gate * self.lora_proj_B(self.lora_proj_A(y)))
+        h = self.mlp_norm(x)
+        if self.conv is not None:
+            h = h + self.conv(F.pad(h.transpose(1, 2), (self.kernel_size - 1, 0))).transpose(1, 2)
+        fc_out = sm.fc(h) + gate * self.lora_fc_B(self.lora_fc_A(h))
+        fc_act = torch.relu(fc_out).square()
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * (sm.proj(fc_act) + gate * self.lora_mlp_proj_B(self.lora_mlp_proj_A(fc_act)))
+        return x
+
+
+class LoRAGPT(nn.Module):
+    """GPT with shared base weights + per-layer LoRA residuals + progressive gate."""
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
+                 num_kv_heads: int, mlp_mult: int, tie_embeddings: bool,
+                 tied_embed_init_std: float, logit_softcap: float, rope_base: float,
+                 qk_gain_init: float, lora_rank: int):
+        super().__init__()
+        self.tie_embeddings, self.tied_embed_init_std = tie_embeddings, tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        hp = Hyperparameters
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                    has_attention=(hp.attn_every_n <= 1 or i % hp.attn_every_n == 0),
-                )
-                for i in range(num_layers)
-            ]
-        )
+        self.shared_attn = CausalSelfAttention(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.shared_mlp = MLP(model_dim, mlp_mult)
+        self.blocks = nn.ModuleList([
+            LoRABlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, lora_rank)
+            for _ in range(num_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        if self.lm_head is not None:
-            self.lm_head._zero_init = True
+        if self.lm_head is not None: self.lm_head._zero_init = True
+        self.register_buffer("_gate", torch.tensor(1.0), persistent=False)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        if self.tie_embeddings:
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        for m in self.modules():
+            if isinstance(m, nn.Linear) and getattr(m, "_zero_init", False):
+                nn.init.zeros_(m.weight)
+
+    def _forward_body(self, input_ids: Tensor) -> Tensor:
+        x = _rms_norm(self.tok_emb(input_ids), (self.tok_emb.weight.size(1),))
+        x0, skips, gate = x, [], self._gate
+        sa, sm = self.shared_attn, self.shared_mlp
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0, sa, sm, gate); skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0, sa, sm, gate)
+        return self.final_norm(x)
+
+    def _logits(self, x: Tensor) -> Tensor:
+        p = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
+        return self.logit_softcap * torch.tanh(p / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self._forward_body(input_ids).reshape(-1, self.tok_emb.weight.size(1))
+        return F.cross_entropy(self._logits(x).float(), target_ids.reshape(-1), reduction="mean")
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        return self._logits(self._forward_body(input_ids))
+
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
+                 num_kv_heads: int, mlp_mult: int, tie_embeddings: bool,
+                 tied_embed_init_std: float, logit_softcap: float, rope_base: float,
+                 qk_gain_init: float):
+        super().__init__()
+        self.tie_embeddings, self.tied_embed_init_std = tie_embeddings, tied_embed_init_std
+        self.logit_softcap = logit_softcap
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.blocks = nn.ModuleList(
+            [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+             for _ in range(num_layers)])
+        self.final_norm = RMSNorm()
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        if self.lm_head is not None: self.lm_head._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -982,6 +979,9 @@ def eval_val_sliding(
     my_s = (total_windows * rank) // world_size
     my_e = (total_windows * (rank + 1)) // world_size
     my_windows = window_starts[my_s:my_e]
+    if args.eval_frac < 1.0:
+        cutoff = max(1, int(len(my_windows) * args.eval_frac))
+        my_windows = my_windows[:cutoff]
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1155,19 +1155,18 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
+    _model_kwargs = dict(
+        vocab_size=args.vocab_size, num_layers=args.num_layers,
+        model_dim=args.model_dim, num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-    ).to(device).to(_amp_dtype)
+    )
+    if args.use_lora_towers:
+        base_model = LoRAGPT(**_model_kwargs, lora_rank=args.lora_rank).to(device).to(_amp_dtype)
+    else:
+        base_model = GPT(**_model_kwargs).to(device).to(_amp_dtype)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1199,6 +1198,12 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    # LoRA Towers: shared base weights also go to Muon
+    if isinstance(base_model, LoRAGPT):
+        for name, p in base_model.shared_attn.named_parameters():
+            (matrix_params if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) else scalar_params).append(p)
+        for name, p in base_model.shared_mlp.named_parameters():
+            (matrix_params if p.ndim == 2 else scalar_params).append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1346,6 +1351,10 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        # LoRA Towers progressive gate
+        if hasattr(base_model, '_gate'):
+            gate_val = min(step / max(args.iterations * args.lora_gate_warmup_frac, 1), 1.0)
+            base_model._gate.fill_(gate_val)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
