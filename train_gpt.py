@@ -99,10 +99,12 @@ class Hyperparameters:
     conv_kernel_size = int(os.environ.get("CONV_KERNEL_SIZE", "3"))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
     mlp_hidden_dim = int(os.environ.get("MLP_HIDDEN_DIM", 0))
-    use_lora_towers = bool(int(os.environ.get("USE_LORA_TOWERS", "0")))
-    lora_rank = int(os.environ.get("LORA_RANK", 64))
-    lora_gate_warmup_frac = float(os.environ.get("LORA_GATE_WARMUP_FRAC", 0.3))
     eval_frac = float(os.environ.get("EVAL_FRAC", "1.0"))
+    recycle_attn_every = int(os.environ.get("RECYCLE_ATTN_EVERY", 0))
+    mlp_widths = os.environ.get("MLP_WIDTHS", "")
+    use_gated_conv = bool(int(os.environ.get("USE_GATED_CONV", "0")))
+    aux_stream_dim = int(os.environ.get("AUX_STREAM_DIM", 0))
+    parallel_residual_from = int(os.environ.get("PARALLEL_RESIDUAL_FROM", 0))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -452,9 +454,9 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if "shared_mlp" in name or ".mlp." in name or "lora_fc" in name or "lora_mlp_proj" in name:
+    if ".mlp." in name or "aux_conv" in name or "conv_gate" in name:
         return "mlp"
-    if "shared_attn" in name or ".attn." in name or "lora_q_" in name or "lora_k_" in name or "lora_v_" in name or "lora_proj_" in name:
+    if ".attn." in name or "aux_down" in name or "aux_up" in name:
         return "attn"
     if ".proj." in name and ".mlp." not in name:
         return "attn"
@@ -697,190 +699,112 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, cached_qk: tuple | None = None) -> tuple[Tensor, Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = _rms_norm(q, (q.size(-1),))
-        k = _rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        # Expand KV heads for GQA if needed (compat with older PyTorch without enable_gqa)
+        if cached_qk is not None:
+            q, k = cached_qk  # reuse Q, K from a previous layer
+        else:
+            q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+            k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q, k = _rms_norm(q, (q.size(-1),)), _rms_norm(k, (k.size(-1),))
+            cos, sin = self.rotary(seqlen, x.device, q.dtype)
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        # Expand KV heads for GQA if needed
         if self.num_kv_heads != self.num_heads:
             rep = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+            k_exp, v_exp = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
+        else:
+            k_exp, v_exp = k, v
+        y = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=None, is_causal=True)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return self.proj(y), q, k
+
+
+def _resolve_hidden(dim: int, mlp_mult: int, hidden_override: int = 0) -> int:
+    if hidden_override > 0: return hidden_override
+    hp = Hyperparameters
+    return hp.mlp_hidden_dim if hp.mlp_hidden_dim > 0 else mlp_mult * dim
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, hidden_override: int = 0):
         super().__init__()
-        hidden = Hyperparameters.mlp_hidden_dim if Hyperparameters.mlp_hidden_dim > 0 else mlp_mult * dim
+        hidden = _resolve_hidden(dim, mlp_mult, hidden_override)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        return self.proj(torch.relu(self.fc(x)).square())
 
 
 class ConvMLP(nn.Module):
-    """Causal depthwise conv + reduced FFN for cheap cross-token mixing."""
-    def __init__(self, dim: int, mlp_mult: int, kernel_size: int = 3):
+    """Causal depthwise conv + optional SwiGLU gate + reduced FFN."""
+    def __init__(self, dim: int, mlp_mult: int, kernel_size: int = 3, hidden_override: int = 0):
         super().__init__()
         self.kernel_size = kernel_size
         self.conv = nn.Conv1d(dim, dim, kernel_size, groups=dim, bias=False)
-        hidden = Hyperparameters.mlp_hidden_dim if Hyperparameters.mlp_hidden_dim > 0 else mlp_mult * dim
+        hp = Hyperparameters
+        self.conv_gate = nn.Conv1d(dim, dim, kernel_size, groups=dim, bias=False) if hp.use_gated_conv else None
+        hidden = _resolve_hidden(dim, mlp_mult, hidden_override)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         xc = F.pad(x.transpose(1, 2), (self.kernel_size - 1, 0))
-        xc = self.conv(xc).transpose(1, 2)
-        x = x + xc
+        if self.conv_gate is not None:
+            xc = self.conv(xc) * torch.sigmoid(self.conv_gate(xc))
+        else:
+            xc = self.conv(xc)
+        x = x + xc.transpose(1, 2)
         return self.proj(torch.relu(self.fc(x)).square())
 
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 rope_base: float, qk_gain_init: float):
+                 rope_base: float, qk_gain_init: float, parallel: bool = False,
+                 mlp_hidden: int = 0, aux_dim: int = 0):
         super().__init__()
+        self.parallel = parallel
         self.attn_norm, self.mlp_norm = RMSNorm(), RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         hp = Hyperparameters
-        self.mlp = ConvMLP(dim, mlp_mult, hp.conv_kernel_size) if hp.use_conv_ffn else MLP(dim, mlp_mult)
+        self.mlp = ConvMLP(dim, mlp_mult, hp.conv_kernel_size, mlp_hidden) if hp.use_conv_ffn else MLP(dim, mlp_mult, mlp_hidden)
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # Auxiliary stream
+        if aux_dim > 0:
+            self.aux_down = CastedLinear(dim, aux_dim, bias=False)
+            self.aux_conv = nn.Conv1d(aux_dim, aux_dim, 3, groups=aux_dim, bias=False)
+            self.aux_up = CastedLinear(aux_dim, dim, bias=False)
+            self.aux_up._zero_init = True
+        else:
+            self.aux_down = None
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, cached_qk: tuple | None = None,
+                x_aux: Tensor | None = None) -> tuple[Tensor, tuple, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        attn_out, q, k = self.attn(self.attn_norm(x), cached_qk=cached_qk)
+        if self.parallel:
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out \
+                  + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        else:
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        # Auxiliary stream
+        if self.aux_down is not None:
+            if x_aux is None:
+                x_aux = self.aux_down(x)
+            a = F.pad(x_aux.transpose(1, 2), (2, 0))
+            x_aux = x_aux + self.aux_conv(a).transpose(1, 2)
+            x = x + self.aux_up(x_aux)
+        return x, (q, k), x_aux
 
-
-class LoRABlock(nn.Module):
-    """Block with shared base weights + per-layer low-rank residuals."""
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 rope_base: float, qk_gain_init: float, rank: int):
-        super().__init__()
-        hp = Hyperparameters
-        self.attn_norm, self.mlp_norm = RMSNorm(), RMSNorm()
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
-        self.head_dim = dim // num_heads
-        kv_dim, hidden = num_kv_heads * self.head_dim, (hp.mlp_hidden_dim if hp.mlp_hidden_dim > 0 else mlp_mult * dim)
-        CL = lambda i, o: CastedLinear(i, o, bias=False)
-        self.lora_q_A, self.lora_q_B = CL(dim, rank), CL(rank, dim)
-        self.lora_k_A, self.lora_k_B = CL(dim, rank), CL(rank, kv_dim)
-        self.lora_v_A, self.lora_v_B = CL(dim, rank), CL(rank, kv_dim)
-        self.lora_proj_A, self.lora_proj_B = CL(dim, rank), CL(rank, dim)
-        self.lora_fc_A, self.lora_fc_B = CL(dim, rank), CL(rank, hidden)
-        self.lora_mlp_proj_A, self.lora_mlp_proj_B = CL(hidden, rank), CL(rank, dim)
-        for n, p in self.named_parameters():
-            if "_B." in n and "weight" in n:
-                nn.init.zeros_(p)
-        self.conv = nn.Conv1d(dim, dim, hp.conv_kernel_size, groups=dim, bias=False) if hp.use_conv_ffn else None
-        self.kernel_size = hp.conv_kernel_size if hp.use_conv_ffn else 0
-
-    def forward(self, x: Tensor, x0: Tensor, sa: CausalSelfAttention, sm: MLP, gate: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        h = self.attn_norm(x)
-        bsz, seqlen, dim = h.shape
-        q = sa.c_q(h) + gate * self.lora_q_B(self.lora_q_A(h))
-        k = sa.c_k(h) + gate * self.lora_k_B(self.lora_k_A(h))
-        v = sa.c_v(h) + gate * self.lora_v_B(self.lora_v_A(h))
-        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q, k = _rms_norm(q, (q.size(-1),)), _rms_norm(k, (k.size(-1),))
-        cos, sin = sa.rotary(seqlen, x.device, q.dtype)
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        if self.num_kv_heads != self.num_heads:
-            rep = self.num_heads // self.num_kv_heads
-            k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * (sa.proj(y) + gate * self.lora_proj_B(self.lora_proj_A(y)))
-        h = self.mlp_norm(x)
-        if self.conv is not None:
-            h = h + self.conv(F.pad(h.transpose(1, 2), (self.kernel_size - 1, 0))).transpose(1, 2)
-        fc_out = sm.fc(h) + gate * self.lora_fc_B(self.lora_fc_A(h))
-        fc_act = torch.relu(fc_out).square()
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * (sm.proj(fc_act) + gate * self.lora_mlp_proj_B(self.lora_mlp_proj_A(fc_act)))
-        return x
-
-
-class LoRAGPT(nn.Module):
-    """GPT with shared base weights + per-layer LoRA residuals + progressive gate."""
-    def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
-                 num_kv_heads: int, mlp_mult: int, tie_embeddings: bool,
-                 tied_embed_init_std: float, logit_softcap: float, rope_base: float,
-                 qk_gain_init: float, lora_rank: int):
-        super().__init__()
-        self.tie_embeddings, self.tied_embed_init_std = tie_embeddings, tied_embed_init_std
-        self.logit_softcap = logit_softcap
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.shared_attn = CausalSelfAttention(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.shared_mlp = MLP(model_dim, mlp_mult)
-        self.blocks = nn.ModuleList([
-            LoRABlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, lora_rank)
-            for _ in range(num_layers)])
-        self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        if self.lm_head is not None: self.lm_head._zero_init = True
-        self.register_buffer("_gate", torch.tensor(1.0), persistent=False)
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        if self.tie_embeddings:
-            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        for m in self.modules():
-            if isinstance(m, nn.Linear) and getattr(m, "_zero_init", False):
-                nn.init.zeros_(m.weight)
-
-    def _forward_body(self, input_ids: Tensor) -> Tensor:
-        x = _rms_norm(self.tok_emb(input_ids), (self.tok_emb.weight.size(1),))
-        x0, skips, gate = x, [], self._gate
-        sa, sm = self.shared_attn, self.shared_mlp
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0, sa, sm, gate); skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0, sa, sm, gate)
-        return self.final_norm(x)
-
-    def _logits(self, x: Tensor) -> Tensor:
-        p = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
-        return self.logit_softcap * torch.tanh(p / self.logit_softcap)
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self._forward_body(input_ids).reshape(-1, self.tok_emb.weight.size(1))
-        return F.cross_entropy(self._logits(x).float(), target_ids.reshape(-1), reduction="mean")
-
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
-        return self._logits(self._forward_body(input_ids))
 
 
 class GPT(nn.Module):
@@ -889,16 +813,22 @@ class GPT(nn.Module):
                  tied_embed_init_std: float, logit_softcap: float, rope_base: float,
                  qk_gain_init: float):
         super().__init__()
+        hp = Hyperparameters
         self.tie_embeddings, self.tied_embed_init_std = tie_embeddings, tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.recycle_every = hp.recycle_attn_every
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-             for _ in range(num_layers)])
+        widths = [int(w) for w in hp.mlp_widths.split(",")] if hp.mlp_widths else []
+        self.blocks = nn.ModuleList([
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                  parallel=(hp.parallel_residual_from > 0 and i >= hp.parallel_residual_from),
+                  mlp_hidden=widths[i] if i < len(widths) else 0,
+                  aux_dim=hp.aux_stream_dim)
+            for i in range(num_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None: self.lm_head._zero_init = True
@@ -911,51 +841,36 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = _rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
+    def _should_recycle(self, i: int) -> bool:
+        return self.recycle_every > 0 and i % self.recycle_every != 0
 
-        # First half stores skips; second half reuses them in reverse order.
+    def _run_blocks(self, input_ids: Tensor) -> Tensor:
+        x = _rms_norm(self.tok_emb(input_ids), (self.tok_emb.weight.size(1),))
+        x0, skips, cached_qk, x_aux = x, [], None, None
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            use_cached = cached_qk if self._should_recycle(i) else None
+            x, qk, x_aux = self.blocks[i](x, x0, cached_qk=use_cached, x_aux=x_aux)
+            if use_cached is None: cached_qk = qk
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            j = self.num_encoder_layers + i
+            use_cached = cached_qk if self._should_recycle(j) else None
+            x, qk, x_aux = self.blocks[j](x, x0, cached_qk=use_cached, x_aux=x_aux)
+            if use_cached is None: cached_qk = qk
+        return self.final_norm(x)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+    def _logits(self, x: Tensor) -> Tensor:
+        p = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
+        return self.logit_softcap * torch.tanh(p / self.logit_softcap)
 
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self._run_blocks(input_ids).reshape(-1, self.tok_emb.weight.size(1))
+        return F.cross_entropy(self._logits(x).float(), target_ids.reshape(-1), reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = _rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-        x = self.final_norm(x)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return self._logits(self._run_blocks(input_ids))
 
 
 def eval_val_sliding(
@@ -1163,10 +1078,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     )
-    if args.use_lora_towers:
-        base_model = LoRAGPT(**_model_kwargs, lora_rank=args.lora_rank).to(device).to(_amp_dtype)
-    else:
-        base_model = GPT(**_model_kwargs).to(device).to(_amp_dtype)
+    base_model = GPT(**_model_kwargs).to(device).to(_amp_dtype)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1175,15 +1087,13 @@ def main() -> None:
     _pt_version = tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2])
     if cap[0] >= 7 and _pt_version >= (2, 4):
         try:
-            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+            _fg = not (args.recycle_attn_every > 0 or args.aux_stream_dim > 0)
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=_fg)
         except Exception:
             compiled_model = base_model
     else:
         compiled_model = base_model
-    _ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
-    if isinstance(base_model, LoRAGPT):
-        _ddp_kwargs["find_unused_parameters"] = True
-    model: nn.Module = DDP(compiled_model, **_ddp_kwargs) if distributed else compiled_model
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1201,12 +1111,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    # LoRA Towers: shared base weights also go to Muon
-    if isinstance(base_model, LoRAGPT):
-        for name, p in base_model.shared_attn.named_parameters():
-            (matrix_params if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) else scalar_params).append(p)
-        for name, p in base_model.shared_mlp.named_parameters():
-            (matrix_params if p.ndim == 2 else scalar_params).append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1354,10 +1258,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        # LoRA Towers progressive gate
-        if hasattr(base_model, '_gate'):
-            gate_val = min(step / max(args.iterations * args.lora_gate_warmup_frac, 1), 1.0)
-            base_model._gate.fill_(gate_val)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
