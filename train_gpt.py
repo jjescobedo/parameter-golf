@@ -679,6 +679,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        has_qk: bool = True,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -691,13 +692,15 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.has_qk = has_qk
+        if has_qk:
+            self.c_q = CastedLinear(dim, dim, bias=False)
+            self.c_k = CastedLinear(dim, kv_dim, bias=False)
+            self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+            self.rotary = Rotary(self.head_dim, base=rope_base)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor, cached_qk: tuple | None = None) -> tuple[Tensor, Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
@@ -766,11 +769,11 @@ class ConvMLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, parallel: bool = False,
-                 mlp_hidden: int = 0, aux_dim: int = 0):
+                 mlp_hidden: int = 0, aux_dim: int = 0, has_own_qk: bool = True):
         super().__init__()
         self.parallel = parallel
         self.attn_norm, self.mlp_norm = RMSNorm(), RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, has_qk=has_own_qk)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         hp = Hyperparameters
         self.mlp = ConvMLP(dim, mlp_mult, hp.conv_kernel_size, mlp_hidden) if hp.use_conv_ffn else MLP(dim, mlp_mult, mlp_hidden)
@@ -800,9 +803,12 @@ class Block(nn.Module):
         if self.aux_down is not None:
             contribution = self.aux_down(x)
             x_aux = contribution if x_aux is None else x_aux + contribution
-            a = F.pad(x_aux.transpose(1, 2), (2, 0))
+            # Pre-norm before conv to keep magnitude bounded across layers
+            a = _rms_norm(x_aux, (x_aux.size(-1),))
+            a = F.pad(a.transpose(1, 2), (2, 0))
             x_aux = x_aux + self.aux_conv(a).transpose(1, 2)
-            x = x + self.aux_up(x_aux)
+            # Pre-norm before aux_up to prevent blow-up during training
+            x = x + self.aux_up(_rms_norm(x_aux, (x_aux.size(-1),)))
         return x, (q, k), x_aux
 
 
@@ -827,7 +833,8 @@ class GPT(nn.Module):
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                   parallel=(hp.parallel_residual_from > 0 and i >= hp.parallel_residual_from),
                   mlp_hidden=widths[i] if i < len(widths) else 0,
-                  aux_dim=hp.aux_stream_dim)
+                  aux_dim=hp.aux_stream_dim,
+                  has_own_qk=not (hp.recycle_attn_every > 0 and i % hp.recycle_attn_every != 0))
             for i in range(num_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -1094,7 +1101,7 @@ def main() -> None:
     else:
         compiled_model = base_model
     _ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
-    if args.recycle_attn_every > 0 or args.aux_stream_dim > 0:
+    if args.aux_stream_dim > 0:
         _ddp_kwargs["find_unused_parameters"] = True
     model: nn.Module = DDP(compiled_model, **_ddp_kwargs) if distributed else compiled_model
 
