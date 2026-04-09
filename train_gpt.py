@@ -100,6 +100,9 @@ class Hyperparameters:
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
     mlp_hidden_dim = int(os.environ.get("MLP_HIDDEN_DIM", 0))
     eval_frac = float(os.environ.get("EVAL_FRAC", "1.0"))
+    mlp_clip = int(os.environ.get("MLP_CLIP", 15))    # 15=int5 (default), 7=int4, 3=int3
+    attn_clip = int(os.environ.get("ATTN_CLIP", 31))  # 31=int6 (default), 15=int5, 7=int4
+    prune_frac = float(os.environ.get("PRUNE_FRAC", 0.03))
     recycle_attn_every = int(os.environ.get("RECYCLE_ATTN_EVERY", 0))
     mlp_widths = os.environ.get("MLP_WIDTHS", "")
     use_gated_conv = bool(int(os.environ.get("USE_GATED_CONV", "0")))
@@ -494,14 +497,14 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             meta[name] = "passthrough_fp16"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            clip = 15 if cat == "mlp" else 31  # int5 for MLP, int6 for attention
+            clip = Hyperparameters.mlp_clip if cat == "mlp" else Hyperparameters.attn_clip
             q, s = quantize_intN_per_row(t, clip_range=clip)
             # Byte shuffle: transpose for better compression
             if q.ndim == 2:
                 q = q.T.contiguous()
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": f"int{5 if cat == 'mlp' else 6}", "transposed": q.ndim == 2}
+            meta[name] = {"type": f"clip{clip}", "transposed": q.ndim == 2}
         else:
             q, s = quantize_float_tensor(t)
             if q.ndim == 2:
@@ -1334,12 +1337,13 @@ def main() -> None:
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
     # Magnitude pruning: zero out smallest weights to improve compression
-    with torch.no_grad():
-        for name, param in base_model.named_parameters():
-            if param.ndim == 2 and param.numel() > 65536:
-                threshold = torch.quantile(param.abs().float().flatten(), 0.03)
-                mask = param.abs() < threshold
-                param.masked_fill_(mask, 0.0)
+    if args.prune_frac > 0:
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                if param.ndim == 2 and param.numel() > 65536:
+                    threshold = torch.quantile(param.abs().float().flatten(), args.prune_frac)
+                    mask = param.abs() < threshold
+                    param.masked_fill_(mask, 0.0)
 
     # Mixed int5/int6 quantization + byte shuffle + zstd/zlib compression
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
