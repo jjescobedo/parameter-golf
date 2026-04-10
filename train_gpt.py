@@ -118,6 +118,15 @@ class Hyperparameters:
     permute_neurons = bool(int(os.environ.get("PERMUTE_NEURONS", "0")))# Idea 6
     ghost_kv_layers = int(os.environ.get("GHOST_KV_LAYERS", 0))        # Idea 7
     impact_prune = bool(int(os.environ.get("IMPACT_PRUNE", "0")))      # Idea 8
+    # SOTA recipe additions (default off / unchanged)
+    ste_qat = bool(int(os.environ.get("STE_QAT", "0")))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 0))
+    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
+    use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "0")))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.0))
+    ortho_init = bool(int(os.environ.get("ORTHO_INIT", "0")))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.0))
+    swa_every = int(os.environ.get("SWA_EVERY", 50))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -143,10 +152,12 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True,
+                 weight_decay: float = 0.0):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov,
+                 weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -192,8 +203,12 @@ class Muon(torch.optim.Optimizer):
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
+            wd = group.get("weight_decay", 0.0)
             curr = 0
             for p in params:
+                # Decoupled weight decay: apply before the gradient update.
+                if wd > 0:
+                    p.data.mul_(1 - lr * wd)
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
@@ -322,7 +337,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear_gate",
     ).split(",")
     if pattern
 )
@@ -469,6 +484,9 @@ def _classify_param(name: str) -> str:
         return "embed"
     # Hypernetwork base MLP (Idea 4): quantize as mlp
     if "hyper_base" in name:
+        return "mlp"
+    # BigramHash embedding/projection: quantize as mlp
+    if "bigram_hash" in name:
         return "mlp"
     if ".mlp." in name or "aux_conv" in name or "conv_gate" in name:
         return "mlp"
@@ -644,11 +662,27 @@ class RMSNorm(nn.Module):
         return _rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def ste_fake_quantize(W: Tensor, clip_range: int) -> Tensor:
+    """Per-row fake quantize with straight-through gradient for QAT."""
+    if W.ndim != 2:
+        return W
+    row_max = W.detach().abs().amax(dim=1, keepdim=True)
+    scale = (row_max / clip_range).clamp_min(1e-12)
+    W_q = torch.clamp(torch.round(W / scale), -(clip_range + 1), clip_range)
+    # Straight-through: forward sees quantized value, backward passes grad to W unchanged.
+    return W + (W_q * scale - W).detach()
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    _ste_clip: int = 0  # set by GPT._init_weights when STE_QAT=1
+
     def forward(self, x: Tensor) -> Tensor:
+        W = self.weight.to(x.dtype)
+        if self.training and self._ste_clip > 0:
+            W = ste_fake_quantize(W, self._ste_clip)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, W, bias)
 
 
 # -----------------------------
@@ -659,6 +693,8 @@ class CastedLinear(nn.Linear):
 # they stay zero. Post-training the structural pattern compresses under zstd much better
 # than random magnitude-pruned zeros.
 class MaskedLinear2to4(nn.Linear):
+    _ste_clip: int = 0
+
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
         super().__init__(in_features, out_features, bias=bias)
         if in_features % 4 != 0:
@@ -679,6 +715,8 @@ class MaskedLinear2to4(nn.Linear):
 
     def forward(self, x: Tensor) -> Tensor:
         W_cast = self.weight.to(x.dtype)
+        if self.training and self._ste_clip > 0:
+            W_cast = ste_fake_quantize(W_cast, self._ste_clip)
         mask = self._compute_mask(W_cast).to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, W_cast * mask, bias)
@@ -988,6 +1026,9 @@ class HyperMLP(nn.Module):
         base = self.base[0]
         W_fc = base.fc_base.weight.to(x.dtype) + (self.fc_u @ self.fc_v.T).to(x.dtype)
         W_proj = base.proj_base.weight.to(x.dtype) + (self.proj_u @ self.proj_v.T).to(x.dtype)
+        if self.training and Hyperparameters.ste_qat:
+            W_fc = ste_fake_quantize(W_fc, Hyperparameters.mlp_clip)
+            W_proj = ste_fake_quantize(W_proj, Hyperparameters.mlp_clip)
         h = torch.relu(F.linear(x, W_fc)).square()
         return F.linear(h, W_proj)
 
@@ -1063,6 +1104,21 @@ class Block(nn.Module):
 
 
 
+class BigramHash(nn.Module):
+    """Hash-based bigram embedding: maps consecutive token pairs to learned vectors."""
+    def __init__(self, num_buckets: int, hash_dim: int, model_dim: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.embed = nn.Embedding(num_buckets, hash_dim)
+        self.proj = CastedLinear(hash_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        prev = F.pad(input_ids[:, :-1], (1, 0), value=0)
+        hashes = (prev.long() * 31 + input_ids.long()) % self.num_buckets
+        return self.proj(self.embed(hashes))
+
+
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: int, tie_embeddings: bool,
@@ -1074,6 +1130,9 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.recycle_every = hp.recycle_attn_every
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        # SOTA: BigramHash + SmearGate
+        self.bigram_hash = BigramHash(hp.bigram_hash_buckets, hp.bigram_hash_dim, model_dim) if hp.bigram_hash_buckets > 0 else None
+        self.smear_gate = nn.Parameter(torch.full((model_dim,), 3.0, dtype=torch.float32)) if hp.use_smear_gate else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -1124,17 +1183,40 @@ class GPT(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
+        hp = Hyperparameters
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        # Orthogonal init: all non-zero-init linears get orthogonal weights for faster convergence.
+        if hp.ortho_init:
+            for module in self.modules():
+                if isinstance(module, (CastedLinear, MaskedLinear2to4)):
+                    if not getattr(module, "_zero_init", False):
+                        nn.init.orthogonal_(module.weight)
+        # STE QAT: stamp _ste_clip on every CastedLinear / MaskedLinear2to4 based on param category.
+        if hp.ste_qat:
+            for name, module in self.named_modules():
+                if isinstance(module, (CastedLinear, MaskedLinear2to4)):
+                    cat = _classify_param(name + ".weight")
+                    if cat == "mlp":
+                        module._ste_clip = hp.mlp_clip
+                    elif cat == "attn":
+                        module._ste_clip = hp.attn_clip
+                    # embed/other: leave at 0 (no fake quantize)
 
     def _should_recycle(self, i: int) -> bool:
         return self.recycle_every > 0 and i % self.recycle_every != 0
 
     def _run_blocks(self, input_ids: Tensor) -> Tensor:
         x = _rms_norm(self.tok_emb(input_ids), (self.tok_emb.weight.size(1),))
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids)
+        if self.smear_gate is not None:
+            gate = torch.sigmoid(self.smear_gate.to(x.dtype))[None, None, :]
+            x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
+            x = gate * x + (1 - gate) * x_prev
         x0, skips, cached_qk, x_aux = x, [], None, None
         for i in range(self.num_encoder_layers):
             use_cached = cached_qk if self._should_recycle(i) else None
@@ -1419,6 +1501,16 @@ def main() -> None:
                 matrix_params.append(p)
             else:
                 scalar_params.append(p)
+    # BigramHash params (outside blocks): matrix → Muon, scalar → Adam.
+    if getattr(base_model, "bigram_hash", None) is not None:
+        for name, p in base_model.bigram_hash.named_parameters():
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                matrix_params.append(p)
+            else:
+                scalar_params.append(p)
+    # SmearGate is a scalar control parameter.
+    if getattr(base_model, "smear_gate", None) is not None:
+        scalar_params.append(base_model.smear_gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1431,13 +1523,15 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1526,6 +1620,9 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    # SWA: collect model snapshots during warmdown for averaging.
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1594,6 +1691,17 @@ def main() -> None:
         # Idea 2: enforce 2:4 sparsity pattern after the optimizer updates weights.
         if args.nm_sparse:
             refresh_nm_masks(base_model)
+        # SWA: collect snapshot when we're deep enough into warmdown.
+        if args.swa_start_frac > 0 and scale < 1.0 and step % args.swa_every == 0:
+            warmdown_progress = 1.0 - scale
+            if warmdown_progress >= args.swa_start_frac:
+                sd = {k: v.detach().float().cpu().clone() for k, v in base_model.state_dict().items()}
+                if swa_state is None:
+                    swa_state = sd
+                else:
+                    for k in swa_state:
+                        swa_state[k].add_(sd[k])
+                swa_count += 1
         zero_grad_all()
 
         step += 1
@@ -1621,6 +1729,16 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    # -----------------------------
+    # SWA: AVERAGE COLLECTED CHECKPOINTS
+    # -----------------------------
+    if swa_state is not None and swa_count > 0:
+        for k in swa_state:
+            swa_state[k] /= swa_count
+        base_model.load_state_dict({k: v.to(device) for k, v in swa_state.items()}, strict=True)
+        log0(f"swa: averaged {swa_count} checkpoints")
+        del swa_state
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
