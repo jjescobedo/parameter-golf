@@ -1283,7 +1283,12 @@ class CodebookMLP(nn.Module):
         super().__init__()
         self.base = [base]
         K = base.K
-        self.alpha_fc   = nn.Parameter(torch.full((K,), 1.0 / math.sqrt(K), dtype=torch.float32))
+        # Init α so std(W_fc) ≈ 0.02 at init (matches Glorot for a full MLP).
+        # With orthogonal U,V columns: std(W) = α · sqrt(K) / sqrt(H · D),
+        # so α = 0.02 · sqrt(H · D / K). Original 1/√K init was ~14× too small,
+        # forced α to drift up during training, and triggered divergence ~step 800.
+        alpha_init = 0.02 * math.sqrt(base.hidden * base.dim / max(K, 1))
+        self.alpha_fc   = nn.Parameter(torch.full((K,), alpha_init, dtype=torch.float32))
         self.alpha_proj = nn.Parameter(torch.zeros(K, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
@@ -1339,9 +1344,14 @@ class CoordMLP(nn.Module):
         self.proj_u = nn.Parameter(torch.empty(base.dim,    rank, dtype=torch.float32))
         self.proj_v = nn.Parameter(torch.empty(base.hidden, rank, dtype=torch.float32))
         nn.init.normal_(self.fc_u, std=0.02)
-        nn.init.normal_(self.fc_v, std=0.02)
+        nn.init.zeros_(self.fc_v)   # zero-init so initial fc residual base is 0 (matches proj convention)
         nn.init.zeros_(self.proj_u)
         nn.init.zeros_(self.proj_v)
+        # Per-layer learnable gate on the coord_net contribution. Init at 0 so initial W
+        # is exactly zero (no contribution from either residual base or coord net). This
+        # absorbs the gradient-amplification problem caused by sharing coord_net across
+        # 2*L call sites per forward pass.
+        self.coord_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         base = self.base[0]
@@ -1358,9 +1368,10 @@ class CoordMLP(nn.Module):
         proj_lt = torch.tensor([l_norm, 1.0], device=x.device, dtype=torch.float32).expand(D * H, 2)
         proj_in = torch.cat([proj_lt, base._proj_grid], dim=-1)
         W_proj_resid = base.coord_net(proj_in).view(D, H)
-        # Add per-layer low-rank base
-        W_fc   = W_fc_resid   + (self.fc_u   @ self.fc_v.T)
-        W_proj = W_proj_resid + (self.proj_u @ self.proj_v.T)
+        # Per-layer gate on coord contribution + low-rank residual base
+        gate = self.coord_gate
+        W_fc   = gate * W_fc_resid   + (self.fc_u   @ self.fc_v.T)
+        W_proj = gate * W_proj_resid + (self.proj_u @ self.proj_v.T)
         if self.training and Hyperparameters.ste_qat:
             W_fc   = ste_fake_quantize(W_fc.float(),   Hyperparameters.mlp_clip)
             W_proj = ste_fake_quantize(W_proj.float(), Hyperparameters.mlp_clip)
