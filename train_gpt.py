@@ -127,6 +127,21 @@ class Hyperparameters:
     ortho_init = bool(int(os.environ.get("ORTHO_INIT", "0")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.0))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
+    # Hypernetwork exploration (fluttering-leaping-sutton plan): 6 MLP variants A-F
+    meta_hyper_mlp  = bool(int(os.environ.get("META_HYPER_MLP", "0")))   # A
+    meta_hyper_rank = int(os.environ.get("META_HYPER_RANK", 192))
+    meta_hyper_code = int(os.environ.get("META_HYPER_CODE", 32))
+    tt_mlp          = bool(int(os.environ.get("TT_MLP", "0")))           # B
+    tt_rank         = int(os.environ.get("TT_RANK", 32))
+    kron_mlp        = bool(int(os.environ.get("KRON_MLP", "0")))         # C
+    kron_num        = int(os.environ.get("KRON_NUM", 16))
+    ut_film         = bool(int(os.environ.get("UT_FILM", "0")))          # D
+    ut_depth        = int(os.environ.get("UT_DEPTH", 28))
+    codebook_mlp    = bool(int(os.environ.get("CODEBOOK_MLP", "0")))     # E
+    codebook_k      = int(os.environ.get("CODEBOOK_K", 64))
+    coord_mlp       = bool(int(os.environ.get("COORD_MLP", "0")))        # F
+    coord_hidden    = int(os.environ.get("COORD_HIDDEN", 64))
+    coord_base_rank = int(os.environ.get("COORD_BASE_RANK", 8))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -484,6 +499,10 @@ def _classify_param(name: str) -> str:
         return "embed"
     # Hypernetwork base MLP (Idea 4): quantize as mlp
     if "hyper_base" in name:
+        return "mlp"
+    # fluttering-leaping-sutton: 6 hypernet variant bases all classify as mlp
+    if ("meta_hyper_base" in name or "tt_base" in name or "kron_base" in name
+            or "codebook_base" in name or "coord_base" in name):
         return "mlp"
     # BigramHash embedding/projection: quantize as mlp
     if "bigram_hash" in name:
@@ -1033,12 +1052,335 @@ class HyperMLP(nn.Module):
         return F.linear(h, W_proj)
 
 
+# -----------------------------
+# fluttering-leaping-sutton: 6 hypernetwork MLP variants A-F
+# -----------------------------
+# All variants: shared *Base module holds global factors, per-layer *MLP module holds
+# tiny per-layer state with self.base = [base] (list-wrapped to skip submodule registration).
+# Each variant reconstructs W_fc (hidden,dim) and W_proj (dim,hidden), applies STE-QAT
+# in fp32, then runs ReLU^2 MLP via F.linear in x.dtype.
+
+def _three_factors(n: int) -> tuple[int, int, int]:
+    """Factor n into 3 most-balanced integer factors. Used for TT-MLP mode shapes."""
+    if n <= 1:
+        return (1, 1, max(n, 1))
+    best = (1, 1, n)
+    upper = max(2, int(round(n ** (1 / 3))) + 5)
+    for a in range(1, upper):
+        if n % a != 0: continue
+        m = n // a
+        for b in range(a, int(m ** 0.5) + 1):
+            if m % b != 0: continue
+            c = m // b
+            triple = (a, b, c)
+            if max(triple) - min(triple) < max(best) - min(best):
+                best = triple
+    return best
+
+
+# --- A. MetaHyperMLP: shared U/V bases + per-layer code + tiny generator ---
+class MetaHyperBase(nn.Module):
+    def __init__(self, dim: int, hidden: int, rank: int, code_dim: int):
+        super().__init__()
+        self.dim, self.hidden, self.rank, self.code_dim = dim, hidden, rank, code_dim
+        # Shared factor bases (rank-r factorization of each MLP matrix)
+        self.fc_U   = nn.Parameter(torch.empty(hidden, rank, dtype=torch.float32))
+        self.fc_V   = nn.Parameter(torch.empty(dim,    rank, dtype=torch.float32))
+        self.proj_U = nn.Parameter(torch.empty(dim,    rank, dtype=torch.float32))
+        self.proj_V = nn.Parameter(torch.empty(hidden, rank, dtype=torch.float32))
+        for p in (self.fc_U, self.fc_V, self.proj_U, self.proj_V):
+            nn.init.orthogonal_(p)
+        # Tiny generators: code_dim -> 4*code_dim -> rank
+        gh = max(4 * code_dim, 64)
+        self.fc_gen = nn.Sequential(
+            nn.Linear(code_dim, gh, bias=True), nn.GELU(),
+            nn.Linear(gh, rank, bias=True),
+        )
+        self.proj_gen = nn.Sequential(
+            nn.Linear(code_dim, gh, bias=True), nn.GELU(),
+            nn.Linear(gh, rank, bias=True),
+        )
+        # Init generator output layers small so initial W ~ U·V^T (uniform init)
+        nn.init.normal_(self.fc_gen[-1].weight,  std=0.02)
+        nn.init.ones_(self.fc_gen[-1].bias)
+        nn.init.zeros_(self.proj_gen[-1].weight)
+        nn.init.zeros_(self.proj_gen[-1].bias)
+
+
+class MetaHyperMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int, base: MetaHyperBase):
+        super().__init__()
+        self.base = [base]
+        self.code = nn.Parameter(torch.zeros(base.code_dim, dtype=torch.float32))
+        nn.init.normal_(self.code, std=0.02)
+
+    def forward(self, x: Tensor) -> Tensor:
+        base = self.base[0]
+        s_fc   = base.fc_gen(self.code)    # (rank,)
+        s_proj = base.proj_gen(self.code)  # (rank,)
+        W_fc   = (base.fc_U   * s_fc[None, :])   @ base.fc_V.T   # (hidden, dim)
+        W_proj = (base.proj_U * s_proj[None, :]) @ base.proj_V.T # (dim, hidden)
+        if self.training and Hyperparameters.ste_qat:
+            W_fc   = ste_fake_quantize(W_fc.float(),   Hyperparameters.mlp_clip)
+            W_proj = ste_fake_quantize(W_proj.float(), Hyperparameters.mlp_clip)
+        W_fc, W_proj = W_fc.to(x.dtype), W_proj.to(x.dtype)
+        h = torch.relu(F.linear(x, W_fc)).square()
+        return F.linear(h, W_proj)
+
+
+# --- B. TT-MLP: tensor-train decomposition of MLP weight matrices ---
+class TTMLPBase(nn.Module):
+    def __init__(self, dim: int, hidden: int, tt_rank: int):
+        super().__init__()
+        self.dim, self.hidden, self.tt_rank = dim, hidden, tt_rank
+        self.h_factors = _three_factors(hidden)  # (h1, h2, h3)
+        self.d_factors = _three_factors(dim)     # (d1, d2, d3)
+
+
+class TTMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int, base: TTMLPBase):
+        super().__init__()
+        self.base = [base]
+        h1, h2, h3 = base.h_factors
+        d1, d2, d3 = base.d_factors
+        r = base.tt_rank
+        # W_fc cores (row-mode hidden, col-mode dim). Boundary cores have rank-1 outer dim.
+        self.fc_g1 = nn.Parameter(torch.empty(1, h1, d1, r, dtype=torch.float32))
+        self.fc_g2 = nn.Parameter(torch.empty(r, h2, d2, r, dtype=torch.float32))
+        self.fc_g3 = nn.Parameter(torch.empty(r, h3, d3, 1, dtype=torch.float32))
+        # W_proj cores (row-mode dim, col-mode hidden)
+        self.proj_g1 = nn.Parameter(torch.empty(1, d1, h1, r, dtype=torch.float32))
+        self.proj_g2 = nn.Parameter(torch.empty(r, d2, h2, r, dtype=torch.float32))
+        self.proj_g3 = nn.Parameter(torch.empty(r, d3, h3, 1, dtype=torch.float32))
+        # Init: small normal for fc, zero for proj (matches proj._zero_init convention)
+        for p in (self.fc_g1, self.fc_g2, self.fc_g3):
+            nn.init.normal_(p, std=0.1)
+        for p in (self.proj_g1, self.proj_g2, self.proj_g3):
+            nn.init.zeros_(p)
+
+    @staticmethod
+    def _reconstruct(g1: Tensor, g2: Tensor, g3: Tensor) -> Tensor:
+        # g1: (1, A, B, C), g2: (C, D, E, F), g3: (F, G, H, 1)
+        # T[A,D,G,B,E,H] = sum_{C,F} g1[0,A,B,C] * g2[C,D,E,F] * g3[F,G,H,0]
+        g1s = g1.squeeze(0)   # (A, B, C)
+        g3s = g3.squeeze(-1)  # (F, G, H)
+        T = torch.einsum('ABc,cDEf,fGH->ADGBEH', g1s, g2, g3s)
+        A, D, G, B, E, H = T.shape
+        return T.reshape(A * D * G, B * E * H)
+
+    def forward(self, x: Tensor) -> Tensor:
+        base = self.base[0]
+        W_fc   = self._reconstruct(self.fc_g1,   self.fc_g2,   self.fc_g3)
+        W_proj = self._reconstruct(self.proj_g1, self.proj_g2, self.proj_g3)
+        # Sanity (cheap, only first call needs to verify shape)
+        assert W_fc.shape   == (base.hidden, base.dim), f"TT W_fc shape {W_fc.shape} != ({base.hidden},{base.dim})"
+        assert W_proj.shape == (base.dim, base.hidden), f"TT W_proj shape {W_proj.shape} != ({base.dim},{base.hidden})"
+        if self.training and Hyperparameters.ste_qat:
+            W_fc   = ste_fake_quantize(W_fc.float(),   Hyperparameters.mlp_clip)
+            W_proj = ste_fake_quantize(W_proj.float(), Hyperparameters.mlp_clip)
+        W_fc, W_proj = W_fc.to(x.dtype), W_proj.to(x.dtype)
+        h = torch.relu(F.linear(x, W_fc)).square()
+        return F.linear(h, W_proj)
+
+
+# --- C. KronMLP: sum of K Kronecker products ---
+def _kron_factors(n: int) -> tuple[int, int]:
+    """Factor n into (a, b) with a*b=n, as balanced as possible."""
+    if n <= 1: return (1, max(n, 1))
+    best = (1, n)
+    for a in range(1, int(n ** 0.5) + 1):
+        if n % a == 0:
+            b = n // a
+            if abs(b - a) < abs(best[1] - best[0]):
+                best = (a, b)
+    return best
+
+
+class KronMLPBase(nn.Module):
+    def __init__(self, dim: int, hidden: int, K: int):
+        super().__init__()
+        self.dim, self.hidden, self.K = dim, hidden, K
+        # W_fc shape: (hidden, dim) = (m1*m2, n1*n2)
+        self.fc_m1, self.fc_m2 = _kron_factors(hidden)
+        self.fc_n1, self.fc_n2 = _kron_factors(dim)
+        # W_proj shape: (dim, hidden) = (m1'*m2', n1'*n2')
+        self.proj_m1, self.proj_m2 = _kron_factors(dim)
+        self.proj_n1, self.proj_n2 = _kron_factors(hidden)
+
+
+class KronMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int, base: KronMLPBase):
+        super().__init__()
+        self.base = [base]
+        K = base.K
+        # fc factors
+        self.fc_A = nn.Parameter(torch.empty(K, base.fc_m1, base.fc_n1, dtype=torch.float32))
+        self.fc_B = nn.Parameter(torch.empty(K, base.fc_m2, base.fc_n2, dtype=torch.float32))
+        # proj factors (zero init)
+        self.proj_A = nn.Parameter(torch.empty(K, base.proj_m1, base.proj_n1, dtype=torch.float32))
+        self.proj_B = nn.Parameter(torch.empty(K, base.proj_m2, base.proj_n2, dtype=torch.float32))
+        nn.init.normal_(self.fc_A, std=0.05)
+        nn.init.normal_(self.fc_B, std=0.05)
+        nn.init.zeros_(self.proj_A)
+        nn.init.zeros_(self.proj_B)
+
+    @staticmethod
+    def _kron_sum(A: Tensor, B: Tensor, m1: int, m2: int, n1: int, n2: int) -> Tensor:
+        # A: (K, m1, n1), B: (K, m2, n2)
+        # out[i1*m2+i2, j1*n2+j2] = sum_k A[k,i1,j1] * B[k,i2,j2]
+        # einsum produces (m1, m2, n1, n2) then reshape
+        T = torch.einsum('kab,kcd->acbd', A, B)  # (m1, m2, n1, n2)
+        return T.reshape(m1 * m2, n1 * n2)
+
+    def forward(self, x: Tensor) -> Tensor:
+        base = self.base[0]
+        W_fc = self._kron_sum(self.fc_A, self.fc_B, base.fc_m1, base.fc_m2, base.fc_n1, base.fc_n2)
+        W_proj = self._kron_sum(self.proj_A, self.proj_B, base.proj_m1, base.proj_m2, base.proj_n1, base.proj_n2)
+        assert W_fc.shape   == (base.hidden, base.dim), f"Kron W_fc shape {W_fc.shape}"
+        assert W_proj.shape == (base.dim, base.hidden), f"Kron W_proj shape {W_proj.shape}"
+        if self.training and Hyperparameters.ste_qat:
+            W_fc   = ste_fake_quantize(W_fc.float(),   Hyperparameters.mlp_clip)
+            W_proj = ste_fake_quantize(W_proj.float(), Hyperparameters.mlp_clip)
+        W_fc, W_proj = W_fc.to(x.dtype), W_proj.to(x.dtype)
+        h = torch.relu(F.linear(x, W_fc)).square()
+        return F.linear(h, W_proj)
+
+
+# --- D. UT-FiLM: shared block + per-depth FiLM modulation ---
+class FiLMWrapper(nn.Module):
+    """Wraps a single shared Block; applies per-depth FiLM (gamma, beta) to its output x."""
+    def __init__(self, shared_block: "Block", dim: int, depth_idx: int):
+        super().__init__()
+        self._block_ref = [shared_block]  # list-wrap: share params across depths without re-registration
+        self.depth_idx = depth_idx
+        self.film_gamma = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.film_beta  = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor, x0: Tensor, cached_qk: tuple | None = None,
+                x_aux: Tensor | None = None) -> tuple[Tensor, tuple, Tensor | None]:
+        x_out, qk, x_aux_out = self._block_ref[0](x, x0, cached_qk=cached_qk, x_aux=x_aux)
+        gamma = self.film_gamma.to(dtype=x_out.dtype)[None, None, :]
+        beta  = self.film_beta.to(dtype=x_out.dtype)[None, None, :]
+        return gamma * x_out + beta, qk, x_aux_out
+
+
+# --- E. CodebookMLP: shared rank-1 atom dictionary + per-layer dense coefficients ---
+class CodebookMLPBase(nn.Module):
+    def __init__(self, dim: int, hidden: int, K: int):
+        super().__init__()
+        self.dim, self.hidden, self.K = dim, hidden, K
+        # Each pair (U[:,k], V[:,k]) defines a rank-1 atom for fc / proj
+        self.fc_U   = nn.Parameter(torch.empty(hidden, K, dtype=torch.float32))
+        self.fc_V   = nn.Parameter(torch.empty(dim,    K, dtype=torch.float32))
+        self.proj_U = nn.Parameter(torch.empty(dim,    K, dtype=torch.float32))
+        self.proj_V = nn.Parameter(torch.empty(hidden, K, dtype=torch.float32))
+        for p in (self.fc_U, self.fc_V, self.proj_U, self.proj_V):
+            nn.init.orthogonal_(p)
+
+
+class CodebookMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int, base: CodebookMLPBase):
+        super().__init__()
+        self.base = [base]
+        K = base.K
+        self.alpha_fc   = nn.Parameter(torch.full((K,), 1.0 / math.sqrt(K), dtype=torch.float32))
+        self.alpha_proj = nn.Parameter(torch.zeros(K, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        base = self.base[0]
+        W_fc   = (base.fc_U   * self.alpha_fc[None, :])   @ base.fc_V.T
+        W_proj = (base.proj_U * self.alpha_proj[None, :]) @ base.proj_V.T
+        if self.training and Hyperparameters.ste_qat:
+            W_fc   = ste_fake_quantize(W_fc.float(),   Hyperparameters.mlp_clip)
+            W_proj = ste_fake_quantize(W_proj.float(), Hyperparameters.mlp_clip)
+        W_fc, W_proj = W_fc.to(x.dtype), W_proj.to(x.dtype)
+        h = torch.relu(F.linear(x, W_fc)).square()
+        return F.linear(h, W_proj)
+
+
+# --- F. CoordMLP: implicit neural weight field + per-layer low-rank residual base ---
+class CoordMLPBase(nn.Module):
+    def __init__(self, dim: int, hidden: int, num_layers: int, hidden_dim: int):
+        super().__init__()
+        self.dim, self.hidden, self.num_layers = dim, hidden, num_layers
+        # Tiny coord net: (l_norm, t_flag, i_norm, j_norm) -> scalar
+        self.coord_net = nn.Sequential(
+            nn.Linear(4, hidden_dim, bias=True), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim, bias=True), nn.GELU(),
+            nn.Linear(hidden_dim, 1, bias=True),
+        )
+        nn.init.zeros_(self.coord_net[-1].weight)
+        nn.init.zeros_(self.coord_net[-1].bias)
+        # Cached index grids (built lazily on first forward, per device)
+        self._fc_grid: Tensor | None = None
+        self._proj_grid: Tensor | None = None
+
+    def _build_grids(self, device: torch.device) -> None:
+        H, D = self.hidden, self.dim
+        ii = torch.arange(H, device=device, dtype=torch.float32) / max(H - 1, 1)
+        jj = torch.arange(D, device=device, dtype=torch.float32) / max(D - 1, 1)
+        I, J = torch.meshgrid(ii, jj, indexing='ij')
+        self._fc_grid = torch.stack([I, J], dim=-1).reshape(-1, 2)  # (H*D, 2)
+        ii2 = torch.arange(D, device=device, dtype=torch.float32) / max(D - 1, 1)
+        jj2 = torch.arange(H, device=device, dtype=torch.float32) / max(H - 1, 1)
+        I2, J2 = torch.meshgrid(ii2, jj2, indexing='ij')
+        self._proj_grid = torch.stack([I2, J2], dim=-1).reshape(-1, 2)  # (D*H, 2)
+
+
+class CoordMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int, base: CoordMLPBase, layer_idx: int):
+        super().__init__()
+        self.base = [base]
+        self.layer_idx = layer_idx
+        # Per-layer low-rank residual base (so coord_net only models smoothed residual)
+        rank = Hyperparameters.coord_base_rank
+        self.fc_u   = nn.Parameter(torch.empty(base.hidden, rank, dtype=torch.float32))
+        self.fc_v   = nn.Parameter(torch.empty(base.dim,    rank, dtype=torch.float32))
+        self.proj_u = nn.Parameter(torch.empty(base.dim,    rank, dtype=torch.float32))
+        self.proj_v = nn.Parameter(torch.empty(base.hidden, rank, dtype=torch.float32))
+        nn.init.normal_(self.fc_u, std=0.02)
+        nn.init.normal_(self.fc_v, std=0.02)
+        nn.init.zeros_(self.proj_u)
+        nn.init.zeros_(self.proj_v)
+
+    def forward(self, x: Tensor) -> Tensor:
+        base = self.base[0]
+        if base._fc_grid is None or base._fc_grid.device != x.device:
+            base._build_grids(x.device)
+        H, D = base.hidden, base.dim
+        L = max(base.num_layers - 1, 1)
+        l_norm = float(self.layer_idx) / L
+        # Coord net evaluation for fc (matrix type t=0)
+        fc_lt = torch.tensor([l_norm, 0.0], device=x.device, dtype=torch.float32).expand(H * D, 2)
+        fc_in = torch.cat([fc_lt, base._fc_grid], dim=-1)  # (H*D, 4)
+        W_fc_resid = base.coord_net(fc_in).view(H, D)
+        # Coord net evaluation for proj (matrix type t=1)
+        proj_lt = torch.tensor([l_norm, 1.0], device=x.device, dtype=torch.float32).expand(D * H, 2)
+        proj_in = torch.cat([proj_lt, base._proj_grid], dim=-1)
+        W_proj_resid = base.coord_net(proj_in).view(D, H)
+        # Add per-layer low-rank base
+        W_fc   = W_fc_resid   + (self.fc_u   @ self.fc_v.T)
+        W_proj = W_proj_resid + (self.proj_u @ self.proj_v.T)
+        if self.training and Hyperparameters.ste_qat:
+            W_fc   = ste_fake_quantize(W_fc.float(),   Hyperparameters.mlp_clip)
+            W_proj = ste_fake_quantize(W_proj.float(), Hyperparameters.mlp_clip)
+        W_fc, W_proj = W_fc.to(x.dtype), W_proj.to(x.dtype)
+        h = torch.relu(F.linear(x, W_fc)).square()
+        return F.linear(h, W_proj)
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, parallel: bool = False,
                  mlp_hidden: int = 0, aux_dim: int = 0, has_own_qk: bool = True,
                  ghost_kv: bool = False, lane_start: int = 0, lane_end: int = 0,
-                 hyper_base: "HyperBase | None" = None):
+                 hyper_base: "HyperBase | None" = None,
+                 meta_hyper_base: "MetaHyperBase | None" = None,
+                 tt_base: "TTMLPBase | None" = None,
+                 kron_base: "KronMLPBase | None" = None,
+                 codebook_base: "CodebookMLPBase | None" = None,
+                 coord_base: "CoordMLPBase | None" = None,
+                 layer_idx: int = 0):
         super().__init__()
         self.parallel = parallel
         self.attn_norm, self.mlp_norm = RMSNorm(), RMSNorm()
@@ -1055,6 +1397,16 @@ class Block(nn.Module):
         if hyper_base is not None:
             # Idea 4: hypernet MLP uses shared base
             self.mlp = HyperMLP(mlp_dim, mlp_mult, hyper_base, hp.hyper_rank)
+        elif meta_hyper_base is not None:
+            self.mlp = MetaHyperMLP(mlp_dim, mlp_mult, meta_hyper_base)
+        elif tt_base is not None:
+            self.mlp = TTMLP(mlp_dim, mlp_mult, tt_base)
+        elif kron_base is not None:
+            self.mlp = KronMLP(mlp_dim, mlp_mult, kron_base)
+        elif codebook_base is not None:
+            self.mlp = CodebookMLP(mlp_dim, mlp_mult, codebook_base)
+        elif coord_base is not None:
+            self.mlp = CoordMLP(mlp_dim, mlp_mult, coord_base, layer_idx)
         elif hp.use_conv_ffn:
             self.mlp = ConvMLP(mlp_dim, mlp_mult, hp.conv_kernel_size, mlp_hidden, lane_dim=mlp_dim)
         else:
@@ -1147,6 +1499,14 @@ class GPT(nn.Module):
         if hp.hyper_mlp:
             hyper_hidden = _resolve_hidden(model_dim, mlp_mult, 0)
             self.hyper_base = HyperBase(model_dim, hyper_hidden)
+        # fluttering-leaping-sutton: hypernet variant bases (A,B,C,E,F)
+        hyper_hidden = _resolve_hidden(model_dim, mlp_mult, 0)
+        self.meta_hyper_base = MetaHyperBase(model_dim, hyper_hidden,
+                                             hp.meta_hyper_rank, hp.meta_hyper_code) if hp.meta_hyper_mlp else None
+        self.tt_base = TTMLPBase(model_dim, hyper_hidden, hp.tt_rank) if hp.tt_mlp else None
+        self.kron_base = KronMLPBase(model_dim, hyper_hidden, hp.kron_num) if hp.kron_mlp else None
+        self.codebook_base = CodebookMLPBase(model_dim, hyper_hidden, hp.codebook_k) if hp.codebook_mlp else None
+        self.coord_base = CoordMLPBase(model_dim, hyper_hidden, num_layers, hp.coord_hidden) if hp.coord_mlp else None
         # Idea 5: Möbius alternating half-lanes
         def lane_for(i: int) -> tuple[int, int]:
             if not hp.mobius_mlp:
@@ -1157,18 +1517,41 @@ class GPT(nn.Module):
         def ghost_for(i: int) -> bool:
             return hp.ghost_kv_layers > 0 and i < hp.ghost_kv_layers
 
-        self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, kv_for(i), mlp_mult, rope_base, qk_gain_init,
-                  parallel=(hp.parallel_residual_from > 0 and i >= hp.parallel_residual_from),
-                  mlp_hidden=widths[i] if i < len(widths) else 0,
-                  aux_dim=hp.aux_stream_dim,
-                  has_own_qk=not (hp.recycle_attn_every > 0 and i % hp.recycle_attn_every != 0),
-                  ghost_kv=ghost_for(i),
-                  lane_start=lane_for(i)[0], lane_end=lane_for(i)[1],
-                  hyper_base=self.hyper_base)
-            for i in range(num_layers)])
+        if hp.ut_film:
+            # D. UT-FiLM: build ONE block, wrap it with per-depth FiLM modulators
+            self._shared_block = Block(model_dim, num_heads, kv_for(0), mlp_mult, rope_base, qk_gain_init,
+                                       parallel=False, mlp_hidden=0, aux_dim=hp.aux_stream_dim,
+                                       has_own_qk=True, ghost_kv=ghost_for(0),
+                                       lane_start=0, lane_end=0, hyper_base=None,
+                                       meta_hyper_base=None, tt_base=None, kron_base=None,
+                                       codebook_base=None, coord_base=None, layer_idx=0)
+            ut_n = hp.ut_depth if hp.ut_depth > 0 else num_layers
+            self.blocks = nn.ModuleList([FiLMWrapper(self._shared_block, model_dim, depth_idx=i)
+                                         for i in range(ut_n)])
+            # Sync encoder/decoder counts to UT depth (skip-connection counts depend on this)
+            self.num_encoder_layers = ut_n // 2
+            self.num_decoder_layers = ut_n - self.num_encoder_layers
+            self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        else:
+            self.blocks = nn.ModuleList([
+                Block(model_dim, num_heads, kv_for(i), mlp_mult, rope_base, qk_gain_init,
+                      parallel=(hp.parallel_residual_from > 0 and i >= hp.parallel_residual_from),
+                      mlp_hidden=widths[i] if i < len(widths) else 0,
+                      aux_dim=hp.aux_stream_dim,
+                      has_own_qk=not (hp.recycle_attn_every > 0 and i % hp.recycle_attn_every != 0),
+                      ghost_kv=ghost_for(i),
+                      lane_start=lane_for(i)[0], lane_end=lane_for(i)[1],
+                      hyper_base=self.hyper_base,
+                      meta_hyper_base=self.meta_hyper_base,
+                      tt_base=self.tt_base,
+                      kron_base=self.kron_base,
+                      codebook_base=self.codebook_base,
+                      coord_base=self.coord_base,
+                      layer_idx=i)
+                for i in range(num_layers)])
         # Idea 1: share attention weights across groups of N layers (post-construction reassign)
-        if hp.share_attn_every > 1:
+        if hp.share_attn_every > 1 and not hp.ut_film:
             for g_start in range(0, num_layers, hp.share_attn_every):
                 anchor = self.blocks[g_start].attn
                 for j in range(g_start + 1, min(g_start + hp.share_attn_every, num_layers)):
@@ -1462,17 +1845,20 @@ def main() -> None:
             # module reuse, or mask recompute.
             _fg = not (args.recycle_attn_every > 0 or args.aux_stream_dim > 0
                        or args.share_attn_every > 1 or args.nm_sparse
-                       or args.hyper_mlp or args.mobius_mlp or args.ghost_kv_layers > 0)
+                       or args.hyper_mlp or args.mobius_mlp or args.ghost_kv_layers > 0
+                       or args.meta_hyper_mlp or args.tt_mlp or args.kron_mlp
+                       or args.ut_film or args.codebook_mlp or args.coord_mlp)
             compiled_model = torch.compile(base_model, dynamic=False, fullgraph=_fg)
         except Exception:
             compiled_model = base_model
     else:
         compiled_model = base_model
     _ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
-    # Shared params (Idea 1), hyper base (Idea 4), Möbius (Idea 5) may leave params
-    # unused on some ranks — DDP needs find_unused_parameters to tolerate that.
+    # Shared params (Idea 1), hyper base (Idea 4), Möbius (Idea 5), and the 6 hypernet
+    # variants (A-F) may leave params unused on some ranks — DDP needs find_unused_parameters.
     if (args.aux_stream_dim > 0 or args.share_attn_every > 1 or args.hyper_mlp
-            or args.mobius_mlp):
+            or args.mobius_mlp or args.meta_hyper_mlp or args.tt_mlp or args.kron_mlp
+            or args.ut_film or args.codebook_mlp or args.coord_mlp):
         _ddp_kwargs["find_unused_parameters"] = True
     model: nn.Module = DDP(compiled_model, **_ddp_kwargs) if distributed else compiled_model
 
@@ -1498,6 +1884,23 @@ def main() -> None:
     if getattr(base_model, "hyper_base", None) is not None:
         for name, p in base_model.hyper_base.named_parameters():
             if p.ndim == 2:
+                matrix_params.append(p)
+            else:
+                scalar_params.append(p)
+    # fluttering-leaping-sutton: hypernet variant bases (A-F) also live outside blocks.
+    for base_attr in ("meta_hyper_base", "tt_base", "kron_base", "codebook_base", "coord_base"):
+        base_mod = getattr(base_model, base_attr, None)
+        if base_mod is None:
+            continue
+        for name, p in base_mod.named_parameters():
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                matrix_params.append(p)
+            else:
+                scalar_params.append(p)
+    # UT-FiLM: shared block lives outside base_model.blocks (FiLMWrappers are in blocks instead).
+    if getattr(base_model, "_shared_block", None) is not None:
+        for name, p in base_model._shared_block.named_parameters():
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
                 matrix_params.append(p)
             else:
                 scalar_params.append(p)
